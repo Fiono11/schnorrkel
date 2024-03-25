@@ -14,9 +14,9 @@
 // Display) should be snake cased, for some reason.
 #![allow(non_snake_case)]
 
+use crate::identifier::Identifier;
 use core::fmt;
 use core::fmt::Display;
-
 
 /// `Result` specialized to this crate for convenience.
 pub type SignatureResult<T> = Result<T, SignatureError>;
@@ -88,7 +88,7 @@ pub enum SignatureError {
         /// Describes the type returning the error
         description: &'static str,
         /// Length expected by the constructor in bytes
-        length: usize
+        length: usize,
     },
     /// Signature not marked as schnorrkel, maybe try ed25519 instead.
     NotMarkedSchnorrkel,
@@ -116,26 +116,32 @@ impl Display for SignatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use self::SignatureError::*;
         match *self {
-            EquationFalse =>
-                write!(f, "Verification equation failed"),
-            PointDecompressionError =>
-                write!(f, "Cannot decompress Ristretto point"),
-            ScalarFormatError =>
-                write!(f, "Cannot use scalar with high-bit set"),
-            InvalidKey =>
-                write!(f, "The provided key is not valid"),
-            BytesLengthError { name, length, .. } =>
-                write!(f, "{name} must be {length} bytes in length"),
-            NotMarkedSchnorrkel => 
-                write!(f, "Signature bytes not marked as a schnorrkel signature"),
-            MuSigAbsent { musig_stage, } =>
-                write!(f, "Absent {musig_stage} violated multi-signature protocol"),
-            MuSigInconsistent { musig_stage, duplicate, } =>
+            EquationFalse => write!(f, "Verification equation failed"),
+            PointDecompressionError => write!(f, "Cannot decompress Ristretto point"),
+            ScalarFormatError => write!(f, "Cannot use scalar with high-bit set"),
+            InvalidKey => write!(f, "The provided key is not valid"),
+            BytesLengthError { name, length, .. } => {
+                write!(f, "{name} must be {length} bytes in length")
+            }
+            NotMarkedSchnorrkel => {
+                write!(f, "Signature bytes not marked as a schnorrkel signature")
+            }
+            MuSigAbsent { musig_stage } => {
+                write!(f, "Absent {musig_stage} violated multi-signature protocol")
+            }
+            MuSigInconsistent {
+                musig_stage,
+                duplicate,
+            } => {
                 if duplicate {
                     write!(f, "Inconsistent duplicate {musig_stage} in multi-signature")
                 } else {
-                    write!(f, "Inconsistent {musig_stage} violated multi-signature protocol")
-                },
+                    write!(
+                        f,
+                        "Inconsistent {musig_stage} violated multi-signature protocol"
+                    )
+                }
+            }
         }
     }
 }
@@ -149,7 +155,78 @@ impl failure::Fail for SignatureError {}
 /// `impl From<SignatureError> for E where E: serde::de::Error`.
 #[cfg(feature = "serde")]
 pub fn serde_error_from_signature_error<E>(err: SignatureError) -> E
-where E: serde_crate::de::Error
+where
+    E: serde::de::Error,
 {
     E::custom(err)
+}
+
+/// A result for the SimplPedPoP protocol.
+pub type DKGResult<T> = Result<T, DKGError>;
+
+/// An error ocurred during the execution of the SimplPedPoP protocol.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DKGError {
+    /// Invalid Proof of Possession.
+    InvalidProofOfPossession(SignatureError),
+    /// Invalid certificate.
+    InvalidCertificate(SignatureError),
+    /// Threshold cannot be greater than the number of participants.
+    ExcessiveThreshold,
+    /// Threshold must be at least 2.
+    InsufficientThreshold,
+    /// Number of participants is invalid.
+    InvalidNumberOfParticipants,
+    /// Incorrect number of coefficient commitments of the secret polynomial.
+    IncorrectNumberOfCoefficientCommitments {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    /// Secret share verification failed.
+    InvalidSecretShare(Identifier),
+    /// Invalid secret.
+    InvalidSecret,
+    /// Unknown identifier.
+    UnknownIdentifier,
+    /// Shared public key mismatch.
+    SharedPublicKeyMismatch,
+    /// Identifier cannot be a zero scalar.
+    InvalidIdentifier,
+    /// Incorrect number of identifiers.
+    IncorrectNumberOfIdentifiers {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    /// Incorrect number of private messages.
+    IncorrectNumberOfPrivateMessages {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    /// Incorrect number of round 1 public messages.
+    IncorrectNumberOfRound1PublicMessages {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    /// Incorrect number of round 2 public messages.
+    IncorrectNumberOfRound2PublicMessages {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    /// Incorrect number of polynomial commitments.
+    IncorrectNumberOfSecretPolynomialCommitments {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
 }
