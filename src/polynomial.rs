@@ -128,6 +128,7 @@ impl PolynomialCommitment {
 #[cfg(test)]
 mod tests {
     use crate::{
+        points::Element,
         polynomial::{Coefficient, Polynomial, PolynomialCommitment},
         simplpedpop::GENERATOR,
     };
@@ -178,18 +179,18 @@ mod tests {
     #[test]
     fn test_sum_secret_polynomial_commitments() {
         let polynomial_commitment1 = PolynomialCommitment {
-            constant_coefficient_commitment: GENERATOR * Scalar::from(1u64),
+            constant_coefficient_commitment: Element((GENERATOR * Scalar::from(1u64)).compress()),
             non_constant_coefficients_commitments: vec![
-                GENERATOR * Scalar::from(2u64),
-                GENERATOR * Scalar::from(3u64),
+                Element((GENERATOR * Scalar::from(2u64)).compress()),
+                Element((GENERATOR * Scalar::from(3u64)).compress()),
             ],
         };
 
         let polynomial_commitment2 = PolynomialCommitment {
-            constant_coefficient_commitment: GENERATOR * Scalar::from(4u64),
+            constant_coefficient_commitment: Element((GENERATOR * Scalar::from(4u64)).compress()),
             non_constant_coefficients_commitments: vec![
-                GENERATOR * Scalar::from(5u64),
-                GENERATOR * Scalar::from(6u64),
+                Element((GENERATOR * Scalar::from(5u64)).compress()),
+                Element((GENERATOR * Scalar::from(6u64)).compress()),
             ],
         };
 
@@ -207,7 +208,7 @@ mod tests {
         assert_eq!(
             summed_polynomial_commitments
                 .constant_coefficient_commitment
-                .compress(),
+                .0,
             expected_constant_coefficient_commitment.compress(),
             "Constant coefficients commitments do not match"
         );
@@ -226,7 +227,7 @@ mod tests {
             .zip(expected_non_constant_coefficients_commitments.iter())
         {
             assert_eq!(
-                actual.compress(),
+                actual.0,
                 expected.compress(),
                 "Non-constant coefficient commitments do not match"
             );
@@ -236,13 +237,16 @@ mod tests {
     #[test]
     fn test_evaluate_polynomial_commitment() {
         // f(x) = 3 + 2x + x^2
-        let constant_commitment = Scalar::from(3u64) * GENERATOR;
-        let linear_commitment = Scalar::from(2u64) * GENERATOR;
-        let quadratic_commitment = Scalar::from(1u64) * GENERATOR;
+        let constant_commitment = (Scalar::from(3u64) * GENERATOR).compress();
+        let linear_commitment = (Scalar::from(2u64) * GENERATOR).compress();
+        let quadratic_commitment = (Scalar::from(1u64) * GENERATOR).compress();
 
         let polynomial_commitment = PolynomialCommitment {
-            constant_coefficient_commitment: constant_commitment,
-            non_constant_coefficients_commitments: vec![linear_commitment, quadratic_commitment],
+            constant_coefficient_commitment: Element(constant_commitment),
+            non_constant_coefficients_commitments: vec![
+                Element(linear_commitment),
+                Element(quadratic_commitment),
+            ],
         };
 
         let value = Scalar::from(2u64);
@@ -253,7 +257,7 @@ mod tests {
         let result = polynomial_commitment.evaluate(value);
 
         assert_eq!(
-            result.compress(),
+            result.0,
             expected.compress(),
             "The evaluated commitment does not match the expected result"
         );

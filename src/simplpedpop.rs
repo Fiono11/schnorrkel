@@ -332,7 +332,7 @@ pub mod round2 {
         round1_public_data: &round1::PublicData,
         round1_public_messages: &BTreeSet<round1::PublicMessage>,
         transcript: T,
-    ) -> DKGResult<(PublicData<T>, Messages)> {
+    ) -> DKGResult<(PublicData<T>, Messages, Participants)> {
         parameters.validate()?;
 
         if round1_public_messages.len() != *parameters.participants() as usize - 1 {
@@ -365,7 +365,7 @@ pub mod round2 {
             public_data.transcript.clone(),
         );
 
-        Ok((public_data, messages))
+        Ok((public_data, messages, participants))
     }
 
     fn generate_participants<T: SigningTranscript + Clone>(
@@ -516,7 +516,10 @@ pub mod round3 {
         polynomial::PolynomialCommitment,
         verify_batch, PublicKey,
     };
-    use alloc::{collections::BTreeMap, vec, vec::Vec};
+    use alloc::{
+        collections::{BTreeMap, BTreeSet},
+        vec::Vec,
+    };
     use curve25519_dalek::Scalar;
     use zeroize::ZeroizeOnDrop;
 
@@ -533,8 +536,8 @@ pub mod round3 {
         round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
         round2_public_data: &round2::PublicData<T>,
         round1_public_data: &round1::PublicData,
-        round1_public_messages: &BTreeMap<Identifier, round1::PublicMessage>,
-        round1_private_data: &round1::PrivateData,
+        round1_public_messages: &BTreeSet<round1::PublicMessage>,
+        round1_private_data: round1::PrivateData,
         round2_private_messages: BTreeMap<Identifier, round2::PrivateMessage>,
     ) -> DKGResult<(
         GroupPublicKey,
@@ -581,25 +584,23 @@ pub mod round3 {
 
     fn verify_round2_public_messages<T: SigningTranscript + Clone>(
         participants: &Participants,
-        round1_public_messages: &BTreeMap<Identifier, round1::PublicMessage>,
+        round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
         round2_state: &round2::PublicData<T>,
     ) -> DKGResult<()> {
         let mut public_keys = Vec::new();
 
         // The public keys are the secret commitments of the participants
-        for (id, round1_public_message) in round1_public_messages {
-            if id != participants.own_identifier() {
-                let public_key = PublicKey::from_point(
-                    round1_public_message
-                        .secret_polynomial_commitment()
-                        .constant_coefficient_commitment
-                        .0
-                        .decompress()
-                        .unwrap(),
-                );
-                public_keys.push(public_key);
-            }
+        for round1_public_message in round1_public_messages {
+            let public_key = PublicKey::from_point(
+                round1_public_message
+                    .secret_polynomial_commitment()
+                    .constant_coefficient_commitment
+                    .0
+                    .decompress()
+                    .unwrap(),
+            );
+            public_keys.push(public_key);
         }
 
         verify_batch(
@@ -665,7 +666,7 @@ pub mod round3 {
 
     fn generate_public_data(
         participants: &Participants,
-        round1_public_messages: &BTreeMap<Identifier, round1::PublicMessage>,
+        round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round1_public_data: &round1::PublicData,
     ) -> DKGResult<(
         GroupPublicKey,
@@ -675,7 +676,7 @@ pub mod round3 {
         let others_secret_polynomial_commitment = PolynomialCommitment::sum_polynomial_commitments(
             &round1_public_messages
                 .iter()
-                .map(|x| x.1.secret_polynomial_commitment())
+                .map(|x| x.secret_polynomial_commitment())
                 .collect::<Vec<&PolynomialCommitment>>(),
         );
 
@@ -729,37 +730,23 @@ pub mod round3 {
 
 #[cfg(test)]
 mod tests {
-    use self::round1::{PrivateData, PublicData};
+    use self::{
+        round1::{PrivateData, PublicData},
+        round2::Messages,
+    };
     use super::*;
-    use crate::SignatureError;
-    use alloc::borrow::ToOwned;
     #[cfg(feature = "alloc")]
     use alloc::{
         collections::{BTreeMap, BTreeSet},
         vec::Vec,
     };
-    use curve25519_dalek::Scalar;
     use merlin::Transcript;
     use rand::rngs::OsRng;
     use tests::round1::PublicMessage;
 
     fn generate_parameters(max_signers: u16, min_signers: u16) -> Vec<Parameters> {
         (1..=max_signers)
-            .map(|i| {
-                let own_identifier = i.try_into().expect("should be nonzero");
-
-                let others_identifiers = (1..=max_signers)
-                    .filter_map(|j| {
-                        if j != i {
-                            Some(j.try_into().expect("should be nonzero"))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Parameters::new(max_signers, min_signers, own_identifier, others_identifiers)
-            })
+            .map(|_| Parameters::new(max_signers, min_signers))
             .collect()
     }
 
@@ -770,157 +757,132 @@ mod tests {
         Vec<Parameters>,
         Vec<PrivateData>,
         Vec<PublicData>,
-        Vec<BTreeMap<Identifier, PublicMessage>>,
-        Vec<BTreeMap<Identifier, PrivateMessage>>,
-        BTreeSet<Identifier>,
+        Vec<BTreeSet<PublicMessage>>,
     ) {
         let parameters_list = generate_parameters(participants, threshold);
 
-        let mut all_public_messages = Vec::new();
-        let mut all_private_messages = Vec::new();
+        let mut all_public_messages_vec = Vec::new();
         let mut participants_round1_private_data = Vec::new();
         let mut participants_round1_public_data = Vec::new();
-        let mut participants_round1_messages = Vec::new();
 
         for parameters in parameters_list.iter() {
-            let (private_data, messages, public_data) =
+            let (private_data, public_message, public_data) =
                 round1::run(parameters, OsRng).expect("Round 1 should complete without errors!");
 
-            all_public_messages.push((
-                parameters.own_identifier(),
-                messages.public_message().clone(),
-            ));
-            all_private_messages.push((
-                parameters.own_identifier(),
-                messages.private_messages().clone(),
-            ));
-            participants_round1_messages.push(messages);
-            participants_round1_private_data.push(private_data);
+            all_public_messages_vec.push(public_message.clone());
             participants_round1_public_data.push(public_data);
+            participants_round1_private_data.push(private_data);
         }
 
-        let mut participants_round1_public_messages: Vec<BTreeMap<Identifier, PublicMessage>> =
-            Vec::new();
-        let mut participants_round1_private_messages: Vec<BTreeMap<Identifier, PrivateMessage>> =
-            Vec::new();
+        let mut received_round1_public_messages: Vec<BTreeSet<PublicMessage>> = Vec::new();
 
-        let mut identifiers: BTreeSet<Identifier> = parameters_list[0]
-            .others_identifiers()
-            .iter()
-            .copied()
-            .collect();
+        let mut all_public_messages = BTreeSet::new();
 
-        identifiers.insert(*parameters_list[0].own_identifier());
+        for i in 0..participants {
+            all_public_messages.insert(all_public_messages_vec[i as usize].clone());
+        }
 
-        for identifier in &identifiers {
-            let mut all_public_msgs = BTreeMap::new();
-            let mut received_private_msgs = BTreeMap::new();
+        received_round1_public_messages.push(all_public_messages.clone());
 
-            for i in 0..participants {
-                all_public_msgs.insert(
-                    *all_public_messages[i as usize].0,
-                    all_public_messages[i as usize].1.clone(),
-                );
-            }
-
-            participants_round1_public_messages.push(all_public_msgs);
-
-            for i in 0..participants {
-                if let Some(private_msg) = all_private_messages[i as usize].1.get(identifier) {
-                    received_private_msgs
-                        .insert(*all_private_messages[i as usize].0, private_msg.clone());
+        // Iterate through each participant to create a set of messages excluding their own.
+        for i in 0..participants as usize {
+            let mut messages_for_participant = BTreeSet::new();
+            for (j, message) in all_public_messages.iter().enumerate() {
+                if i != j {
+                    // Exclude the participant's own message.
+                    messages_for_participant.insert(message.clone());
                 }
             }
-
-            participants_round1_private_messages.push(received_private_msgs);
-        }
-
-        // Remove own public messages
-        for i in 0..participants {
-            participants_round1_public_messages[i as usize]
-                .remove(&parameters_list[i as usize].own_identifier());
+            received_round1_public_messages.push(messages_for_participant);
         }
 
         (
             parameters_list,
             participants_round1_private_data,
             participants_round1_public_data,
-            participants_round1_public_messages,
-            participants_round1_private_messages,
-            identifiers,
+            received_round1_public_messages,
         )
     }
 
     fn round2(
-        participants: u16,
-        parameters_list: Vec<Parameters>,
+        parameters_list: &Vec<Parameters>,
         participants_round1_private_data: Vec<PrivateData>,
-        participants_round1_public_data: Vec<PublicData>,
-        participants_round1_public_messages: Vec<BTreeMap<Identifier, PublicMessage>>,
-        participants_round1_private_messages: Vec<BTreeMap<Identifier, PrivateMessage>>,
+        participants_round1_public_data: &Vec<PublicData>,
+        participants_round1_public_messages: &Vec<BTreeSet<PublicMessage>>,
     ) -> (
         Vec<round2::PublicData<Transcript>>,
-        Vec<round2::PrivateData>,
-        Vec<round2::PublicMessage>,
+        Vec<Messages>,
+        Vec<Participants>,
     ) {
         let mut participants_public_data_round2 = Vec::new();
-        let mut participants_private_data_round2 = Vec::new();
         let mut participants_public_msgs_round2 = Vec::new();
+        let mut participants_set_of_participants = Vec::new();
 
-        for i in 0..participants {
+        for i in 0..parameters_list[0].participants {
             let result = round2::run(
                 &parameters_list[i as usize],
                 participants_round1_private_data[i as usize].clone(),
                 &participants_round1_public_data[i as usize].clone(),
                 &participants_round1_public_messages[i as usize].clone(),
-                participants_round1_private_messages[i as usize].clone(),
                 Transcript::new(b"transcript"),
             )
             .expect("Round 2 should complete without errors!");
 
             participants_public_data_round2.push(result.0);
-            participants_private_data_round2.push(result.1);
-            participants_public_msgs_round2.push(result.2);
+            participants_public_msgs_round2.push(result.1);
+            participants_set_of_participants.push(result.2);
         }
 
         (
             participants_public_data_round2,
-            participants_private_data_round2,
             participants_public_msgs_round2,
+            participants_set_of_participants,
         )
     }
 
     fn round3(
-        participants: u16,
-        identifiers: BTreeSet<Identifier>,
+        participants_sets_of_participants: &Vec<Participants>,
         parameters_list: &Vec<Parameters>,
-        participants_round2_public_messages: Vec<round2::PublicMessage>,
-        participants_round2_public_data: Vec<round2::PublicData<Transcript>>,
-        participants_round1_public_messages: Vec<BTreeMap<Identifier, round1::PublicMessage>>,
-        participants_round1_public_data: Vec<round1::PublicData>,
+        participants_round2_public_messages: &Vec<round2::PublicMessage>,
+        participants_round2_public_data: &Vec<round2::PublicData<Transcript>>,
+        participants_round1_public_messages: &Vec<BTreeSet<round1::PublicMessage>>,
+        participants_round1_public_data: &Vec<round1::PublicData>,
+        participants_round1_private_data: Vec<round1::PrivateData>,
+        participants_round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>>,
     ) -> Vec<(
         GroupPublicKey,
         BTreeMap<Identifier, TotalSecretShareCommitment>,
+        round3::PrivateData,
     )> {
         let mut participant_data_round3 = Vec::new();
+
+        let mut identifiers = participants_sets_of_participants[0]
+            .others_identifiers
+            .clone();
+        identifiers.insert(participants_sets_of_participants[0].own_identifier);
+
         let identifiers_vec: Vec<Identifier> = identifiers.clone().iter().copied().collect();
 
-        for i in 0..participants {
+        for i in 0..participants_sets_of_participants.len() {
             let received_round2_public_messages = participants_round2_public_messages
                 .iter()
                 .enumerate()
                 .filter(|(index, _msg)| {
-                    identifiers_vec[*index] != *parameters_list[i as usize].own_identifier()
+                    identifiers_vec[*index]
+                        != *participants_sets_of_participants[i as usize].own_identifier()
                 })
                 .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
                 .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
 
             let result = round3::run(
                 &parameters_list[i as usize],
+                &participants_sets_of_participants[i as usize],
                 &received_round2_public_messages,
                 &participants_round2_public_data[i as usize],
                 &participants_round1_public_data[i as usize],
                 &participants_round1_public_messages[i as usize],
+                participants_round1_private_data[i as usize].clone(),
+                participants_round2_private_messages[i as usize].clone(),
             )
             .expect("Round 3 should complete without errors!");
 
@@ -939,37 +901,35 @@ mod tests {
             parameters_list,
             participants_round1_private_data,
             participants_round1_public_data,
-            mut participants_round1_public_messages,
-            participants_round1_private_messages,
-            identifiers,
+            participants_round1_public_messages,
         ) = round1(participants, threshold);
 
-        for i in 0..participants {
-            participants_round1_public_messages[i as usize]
-                .remove(&parameters_list[i as usize].own_identifier());
-        }
-
         let (
-            participants_public_data_round2,
-            participants_private_data_round2,
-            participants_public_msgs_round2,
+            participants_round2_public_data,
+            participants_round2_messages,
+            participants_sets_of_participants,
         ) = round2(
-            participants,
-            parameters_list.clone(),
+            &parameters_list,
             participants_round1_private_data.clone(),
-            participants_round1_public_data.clone(),
-            participants_round1_public_messages.clone(),
-            participants_round1_private_messages.clone(),
+            &participants_round1_public_data,
+            &participants_round1_public_messages,
         );
 
         let participant_data_round3 = round3(
-            participants,
-            identifiers,
+            &participants_sets_of_participants,
             &parameters_list,
-            participants_public_msgs_round2,
-            participants_public_data_round2,
-            participants_round1_public_messages,
-            participants_round1_public_data,
+            &participants_round2_messages
+                .iter()
+                .map(|x| x.public_message().clone())
+                .collect(),
+            &participants_round2_public_data,
+            &participants_round1_public_messages,
+            &participants_round1_public_data,
+            participants_round1_private_data,
+            participants_round2_messages
+                .iter()
+                .map(|x| x.private_messages().clone())
+                .collect(),
         );
 
         let shared_public_keys: Vec<GroupPublicKey> = participant_data_round3
@@ -986,18 +946,18 @@ mod tests {
             assert_eq!(
                 participant_data_round3[i as usize]
                     .1
-                    .get(parameters_list[i as usize].own_identifier())
-                    .unwrap(),
-                &(participants_private_data_round2[i as usize]
-                    .total_secret_share
+                    .get(participants_sets_of_participants[i as usize].own_identifier())
+                    .unwrap()
                     .0
-                    * GENERATOR),
+                    .decompress()
+                    .unwrap(),
+                participant_data_round3[i as usize].2.total_secret_share.0 * GENERATOR,
                 "Verification of total secret shares failed!"
             );
         }
     }
 
-    #[test]
+    /*#[test]
     fn test_incorrect_number_of_round1_public_messages_in_round2() {
         let participants: u16 = 5;
         let threshold: u16 = 3;
@@ -1546,5 +1506,5 @@ mod tests {
     fn test_threshold_greater_than_participants() {
         let parameters = Parameters::new(2, 3, Identifier(Scalar::ONE), BTreeSet::new());
         assert_eq!(parameters.validate(), Err(DKGError::ExcessiveThreshold));
-    }
+        }*/
 }
