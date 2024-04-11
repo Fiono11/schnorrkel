@@ -284,11 +284,13 @@ pub mod round2 {
     };
     use alloc::{
         collections::{BTreeMap, BTreeSet},
+        string::ToString,
         vec::Vec,
     };
     use curve25519_dalek::Scalar;
     use derive_getters::Getters;
     use merlin::Transcript;
+    use sha2::{digest::Update, Digest, Sha512};
     use zeroize::ZeroizeOnDrop;
 
     /// The public data of round 2.
@@ -403,12 +405,14 @@ pub mod round2 {
             index += 1;
         }
 
-        let mut scalar = transcript.challenge_scalar(b"participants");
         let mut others_identifiers: BTreeSet<Identifier> = BTreeSet::new();
 
-        for _ in 0..messages.len() {
-            others_identifiers.insert(Identifier(scalar));
-            scalar += Scalar::ONE;
+        for i in 0..messages.len() {
+            let input = Sha512::new()
+                .chain(transcript.challenge_scalar(b"participants").as_bytes())
+                .chain(i.to_string());
+            let random_scalar = Scalar::from_hash(input);
+            others_identifiers.insert(Identifier(random_scalar));
         }
 
         let own_identifier = others_identifiers.iter().nth(index).cloned(); // Retrieve the element at `index`
