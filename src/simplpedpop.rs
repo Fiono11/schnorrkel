@@ -25,7 +25,7 @@ pub(crate) type SecretPolynomialCommitment = PolynomialCommitment;
 pub(crate) type SecretPolynomial = Polynomial;
 pub(crate) type GroupPublicKey = PublicKey;
 pub(crate) type TotalSecretShare = SecretShare;
-pub(crate) type TotalSecretShareCommitment = CoefficientCommitment;
+pub(crate) type GroupPublicKeyShare = CoefficientCommitment;
 pub(crate) type SecretCommitment = CoefficientCommitment;
 pub(crate) type Certificate = Signature;
 pub(crate) type ProofOfPossession = Signature;
@@ -201,10 +201,12 @@ pub mod round1 {
     pub fn run<R: RngCore + CryptoRng>(
         parameters: &Parameters,
         mut rng: R,
+        yes: bool,
     ) -> DKGResult<(PrivateData, PublicMessage, PublicData)> {
         parameters.validate()?;
 
-        let (private_data, proof_of_possession, public_data) = generate_data(parameters, &mut rng);
+        let (private_data, proof_of_possession, public_data) =
+            generate_data(parameters, &mut rng, yes);
 
         let messages = generate_message(
             &proof_of_possession,
@@ -217,9 +219,10 @@ pub mod round1 {
     fn generate_data<R: RngCore + CryptoRng>(
         parameters: &Parameters,
         mut rng: R,
+        yes: bool,
     ) -> (PrivateData, ProofOfPossession, PublicData) {
         let secret_polynomial = loop {
-            let temp_polynomial = Polynomial::generate(&mut rng, *parameters.threshold());
+            let temp_polynomial = Polynomial::generate(&mut rng, *parameters.threshold(), yes);
             // There must be a secret, which is the constant coefficient of the secret polynomial
             if temp_polynomial.constant_coefficient != Scalar::ZERO {
                 break temp_polynomial;
@@ -334,6 +337,11 @@ pub mod round2 {
         transcript: T,
     ) -> DKGResult<(PublicData<T>, Messages, Participants)> {
         parameters.validate()?;
+        let own_message = round1::PublicMessage {
+            secret_polynomial_commitment: round1_public_data.secret_polynomial_commitment.clone(),
+            proof_of_possession: round1_public_data.proof_of_possession.clone(),
+        };
+        assert!(!round1_public_messages.contains(&own_message));
 
         if round1_public_messages.len() != *parameters.participants() as usize - 1 {
             return Err(DKGError::IncorrectNumberOfRound1PublicMessages {
@@ -488,6 +496,8 @@ pub mod round2 {
             private_messages.insert(*identifier, PrivateMessage::new(SecretShare(secret_share)));
         }
 
+        println!("PRIVATE1: {:?}", private_messages);
+
         let public_key = PublicKey::from_point(secret_commitment.0.decompress().unwrap());
 
         let certificate = secret_key.sign(transcript, &public_key);
@@ -507,8 +517,8 @@ pub mod round2 {
 /// key and the total secret shares commitments of the other partipants.
 pub mod round3 {
     use super::{
-        round1, round2, Certificate, GroupPublicKey, Identifier, Parameters, Participants,
-        SecretPolynomial, SecretShare, TotalSecretShare, TotalSecretShareCommitment, GENERATOR,
+        round1, round2, Certificate, GroupPublicKey, GroupPublicKeyShare, Identifier, Parameters,
+        Participants, SecretPolynomial, SecretShare, TotalSecretShare, GENERATOR,
     };
     use crate::{
         context::SigningTranscript,
@@ -541,11 +551,14 @@ pub mod round3 {
         round2_private_messages: BTreeMap<Identifier, round2::PrivateMessage>,
     ) -> DKGResult<(
         GroupPublicKey,
-        BTreeMap<Identifier, TotalSecretShareCommitment>,
+        BTreeMap<Identifier, GroupPublicKeyShare>,
         PrivateData,
     )> {
+        println!("PRIVATE: {:?}", round2_private_messages);
         parameters.validate()?;
         participants.validate(parameters.participants)?;
+        assert!(!round2_public_messages.contains_key(participants.own_identifier()));
+        assert!(!round2_private_messages.contains_key(participants.own_identifier()));
 
         if round2_public_messages.len() != *parameters.participants() as usize - 1 {
             return Err(DKGError::IncorrectNumberOfRound2PublicMessages {
@@ -568,7 +581,11 @@ pub mod round3 {
             round2_public_data,
         )?;
 
-        verify_round2_private_messages(participants, round1_public_data, &round2_private_messages)?;
+        verify_round2_private_messages(
+            participants,
+            round1_public_messages,
+            &round2_private_messages,
+        )?;
 
         let private_data = generate_private_data(
             participants,
@@ -586,7 +603,7 @@ pub mod round3 {
         participants: &Participants,
         round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
-        round2_state: &round2::PublicData<T>,
+        round2_public_data: &round2::PublicData<T>,
     ) -> DKGResult<()> {
         let mut public_keys = Vec::new();
 
@@ -604,7 +621,7 @@ pub mod round3 {
         }
 
         verify_batch(
-            vec![round2_state.transcript.clone(); participants.others_identifiers().len()],
+            vec![round2_public_data.transcript.clone(); participants.others_identifiers().len()],
             &round2_public_messages
                 .values()
                 .map(|x| x.certificate)
@@ -617,15 +634,18 @@ pub mod round3 {
 
     fn verify_round2_private_messages(
         participants: &Participants,
-        round1_public_data: &round1::PublicData,
+        //round1_public_data: &round1::PublicData,
+        round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round2_private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
     ) -> DKGResult<()> {
         for (identifier, private_message) in round2_private_messages {
             let expected_evaluation = GENERATOR * private_message.secret_share().0;
 
-            let evaluation = round1_public_data
+            let evaluation = round1_public_messages
+                .first()
+                .unwrap()
                 .secret_polynomial_commitment()
-                .evaluate(participants.own_identifier().0)
+                .evaluate(&participants.own_identifier().0)
                 .0
                 .decompress()
                 .unwrap();
@@ -643,7 +663,11 @@ pub mod round3 {
         private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
         secret_polynomial: &SecretPolynomial,
     ) -> DKGResult<PrivateData> {
+        println!("poly: {:?}", secret_polynomial);
+
         let own_secret_share = secret_polynomial.evaluate(&participants.own_identifier().0);
+
+        println!("OWN SHARE: {:?}", own_secret_share);
 
         let mut total_secret_share = Scalar::ZERO;
 
@@ -653,6 +677,15 @@ pub mod round3 {
                 .ok_or(DKGError::UnknownIdentifier)?
                 .secret_share()
                 .0;
+
+            println!(
+                "SHARE: {:?}",
+                private_messages
+                    .get(id)
+                    .ok_or(DKGError::UnknownIdentifier)?
+                    .secret_share()
+                    .0
+            );
         }
 
         total_secret_share += own_secret_share;
@@ -668,15 +701,12 @@ pub mod round3 {
         participants: &Participants,
         round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round1_public_data: &round1::PublicData,
-    ) -> DKGResult<(
-        GroupPublicKey,
-        BTreeMap<Identifier, TotalSecretShareCommitment>,
-    )> {
+    ) -> DKGResult<(GroupPublicKey, BTreeMap<Identifier, GroupPublicKeyShare>)> {
         // Sum of the secret polynomial commitments of the other participants
         let others_secret_polynomial_commitment = PolynomialCommitment::sum_polynomial_commitments(
             &round1_public_messages
                 .iter()
-                .map(|x| x.secret_polynomial_commitment())
+                .map(|msg| msg.secret_polynomial_commitment())
                 .collect::<Vec<&PolynomialCommitment>>(),
         );
 
@@ -687,23 +717,19 @@ pub mod round3 {
                 &round1_public_data.secret_polynomial_commitment,
             ]);
 
-        // The total secret shares commitments of all the participants
-        let mut total_secret_shares_commitments = BTreeMap::new();
+        // The group public key shares of all the participants, which correspond to the total secret shares commitments
+        let mut group_public_key_shares = BTreeMap::new();
 
         for identifier in participants.others_identifiers() {
-            let total_secret_share_commitment =
-                total_secret_polynomial_commitment.evaluate(identifier.0);
+            let group_public_key_share = total_secret_polynomial_commitment.evaluate(&identifier.0);
 
-            total_secret_shares_commitments.insert(*identifier, total_secret_share_commitment);
+            group_public_key_shares.insert(*identifier, group_public_key_share);
         }
 
-        let own_total_secret_share_commitment =
-            total_secret_polynomial_commitment.evaluate(participants.own_identifier.0);
+        let own_group_public_key_share =
+            total_secret_polynomial_commitment.evaluate(&participants.own_identifier.0);
 
-        total_secret_shares_commitments.insert(
-            participants.own_identifier,
-            own_total_secret_share_commitment,
-        );
+        group_public_key_shares.insert(participants.own_identifier, own_group_public_key_share);
 
         let shared_public_key = GroupPublicKey::from_point(
             total_secret_polynomial_commitment
@@ -716,7 +742,7 @@ pub mod round3 {
         // The shared public key corresponds to the secret commitment of the total secret polynomial commitment
         if shared_public_key.as_point()
             != &total_secret_polynomial_commitment
-                .evaluate(Scalar::ZERO)
+                .evaluate(&Scalar::ZERO)
                 .0
                 .decompress()
                 .unwrap()
@@ -724,7 +750,7 @@ pub mod round3 {
             return Err(DKGError::SharedPublicKeyMismatch);
         }
 
-        Ok((shared_public_key, total_secret_shares_commitments))
+        Ok((shared_public_key, group_public_key_shares))
     }
 }
 
@@ -765,13 +791,24 @@ mod tests {
         let mut participants_round1_private_data = Vec::new();
         let mut participants_round1_public_data = Vec::new();
 
-        for parameters in parameters_list.iter() {
-            let (private_data, public_message, public_data) =
-                round1::run(parameters, OsRng).expect("Round 1 should complete without errors!");
+        for i in 0..parameters_list.len() {
+            if i == 0 {
+                let (private_data, public_message, public_data) =
+                    round1::run(&parameters_list[i as usize], OsRng, true)
+                        .expect("Round 1 should complete without errors!");
 
-            all_public_messages_vec.push(public_message.clone());
-            participants_round1_public_data.push(public_data);
-            participants_round1_private_data.push(private_data);
+                all_public_messages_vec.push(public_message.clone());
+                participants_round1_public_data.push(public_data);
+                participants_round1_private_data.push(private_data);
+            } else {
+                let (private_data, public_message, public_data) =
+                    round1::run(&parameters_list[i as usize], OsRng, false)
+                        .expect("Round 1 should complete without errors!");
+
+                all_public_messages_vec.push(public_message.clone());
+                participants_round1_public_data.push(public_data);
+                participants_round1_private_data.push(private_data);
+            }
         }
 
         let mut received_round1_public_messages: Vec<BTreeSet<PublicMessage>> = Vec::new();
@@ -782,17 +819,26 @@ mod tests {
             all_public_messages.insert(all_public_messages_vec[i as usize].clone());
         }
 
-        received_round1_public_messages.push(all_public_messages.clone());
-
         // Iterate through each participant to create a set of messages excluding their own.
         for i in 0..participants as usize {
+            let own_message = PublicMessage::new(
+                participants_round1_public_data[i]
+                    .secret_polynomial_commitment
+                    .clone(),
+                participants_round1_public_data[i]
+                    .proof_of_possession
+                    .clone(),
+            );
+
             let mut messages_for_participant = BTreeSet::new();
+
             for (j, message) in all_public_messages.iter().enumerate() {
-                if i != j {
+                if &own_message != message {
                     // Exclude the participant's own message.
                     messages_for_participant.insert(message.clone());
                 }
             }
+
             received_round1_public_messages.push(messages_for_participant);
         }
 
@@ -813,10 +859,12 @@ mod tests {
         Vec<round2::PublicData<Transcript>>,
         Vec<Messages>,
         Vec<Participants>,
+        Vec<Identifier>,
     ) {
-        let mut participants_public_data_round2 = Vec::new();
-        let mut participants_public_msgs_round2 = Vec::new();
+        let mut participants_round2_public_data = Vec::new();
+        let mut participants_round2_public_messages = Vec::new();
         let mut participants_set_of_participants = Vec::new();
+        let mut identifiers_vec = Vec::new();
 
         for i in 0..parameters_list[0].participants {
             let result = round2::run(
@@ -828,15 +876,17 @@ mod tests {
             )
             .expect("Round 2 should complete without errors!");
 
-            participants_public_data_round2.push(result.0);
-            participants_public_msgs_round2.push(result.1);
-            participants_set_of_participants.push(result.2);
+            participants_round2_public_data.push(result.0);
+            participants_round2_public_messages.push(result.1);
+            participants_set_of_participants.push(result.2.clone());
+            identifiers_vec.push(result.2.own_identifier);
         }
 
         (
-            participants_public_data_round2,
-            participants_public_msgs_round2,
+            participants_round2_public_data,
+            participants_round2_public_messages,
             participants_set_of_participants,
+            identifiers_vec,
         )
     }
 
@@ -849,19 +899,13 @@ mod tests {
         participants_round1_public_data: &Vec<round1::PublicData>,
         participants_round1_private_data: Vec<round1::PrivateData>,
         participants_round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>>,
+        identifiers_vec: &Vec<Identifier>,
     ) -> Vec<(
         GroupPublicKey,
-        BTreeMap<Identifier, TotalSecretShareCommitment>,
+        BTreeMap<Identifier, GroupPublicKeyShare>,
         round3::PrivateData,
     )> {
         let mut participant_data_round3 = Vec::new();
-
-        let mut identifiers = participants_sets_of_participants[0]
-            .others_identifiers
-            .clone();
-        identifiers.insert(participants_sets_of_participants[0].own_identifier);
-
-        let identifiers_vec: Vec<Identifier> = identifiers.clone().iter().copied().collect();
 
         for i in 0..participants_sets_of_participants.len() {
             let received_round2_public_messages = participants_round2_public_messages
@@ -874,6 +918,23 @@ mod tests {
                 .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
                 .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
 
+            let mut collected_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>> =
+                Vec::new();
+
+            for participants in participants_sets_of_participants.iter() {
+                let mut messages_for_participant = BTreeMap::new();
+
+                for (i, round_messages) in participants_round2_private_messages.iter().enumerate() {
+                    if let Some(message) = round_messages.get(&participants.own_identifier) {
+                        messages_for_participant.insert(identifiers_vec[i], message.clone());
+                    }
+                }
+
+                if !messages_for_participant.is_empty() {
+                    collected_messages.push(messages_for_participant);
+                }
+            }
+
             let result = round3::run(
                 &parameters_list[i as usize],
                 &participants_sets_of_participants[i as usize],
@@ -882,7 +943,7 @@ mod tests {
                 &participants_round1_public_data[i as usize],
                 &participants_round1_public_messages[i as usize],
                 participants_round1_private_data[i as usize].clone(),
-                participants_round2_private_messages[i as usize].clone(),
+                collected_messages[i as usize].clone(),
             )
             .expect("Round 3 should complete without errors!");
 
@@ -894,8 +955,8 @@ mod tests {
 
     #[test]
     pub fn test_successful_simplpedpop() {
-        let participants: u16 = 5;
-        let threshold: u16 = 3;
+        let participants: u16 = 2;
+        let threshold: u16 = 2;
 
         let (
             parameters_list,
@@ -908,6 +969,7 @@ mod tests {
             participants_round2_public_data,
             participants_round2_messages,
             participants_sets_of_participants,
+            identifiers_vec,
         ) = round2(
             &parameters_list,
             participants_round1_private_data.clone(),
@@ -915,7 +977,7 @@ mod tests {
             &participants_round1_public_messages,
         );
 
-        let participant_data_round3 = round3(
+        let participants_data_round3 = round3(
             &participants_sets_of_participants,
             &parameters_list,
             &participants_round2_messages
@@ -930,28 +992,29 @@ mod tests {
                 .iter()
                 .map(|x| x.private_messages().clone())
                 .collect(),
+            &identifiers_vec,
         );
 
-        let shared_public_keys: Vec<GroupPublicKey> = participant_data_round3
+        let shared_public_keys: Vec<GroupPublicKey> = participants_data_round3
             .iter()
             .map(|state| state.0)
             .collect();
 
         assert!(
             shared_public_keys.windows(2).all(|w| w[0] == w[1]),
-            "All participants should have the same shared public key!"
+            "All participants must have the same group public key!"
         );
 
         for i in 0..participants {
             assert_eq!(
-                participant_data_round3[i as usize]
+                participants_data_round3[i as usize]
                     .1
                     .get(participants_sets_of_participants[i as usize].own_identifier())
                     .unwrap()
                     .0
                     .decompress()
                     .unwrap(),
-                participant_data_round3[i as usize].2.total_secret_share.0 * GENERATOR,
+                participants_data_round3[i as usize].2.total_secret_share.0 * GENERATOR,
                 "Verification of total secret shares failed!"
             );
         }

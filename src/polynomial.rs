@@ -21,12 +21,19 @@ pub struct Polynomial {
 }
 
 impl Polynomial {
-    pub(crate) fn generate<R: RngCore + CryptoRng>(rng: &mut R, degree: u16) -> Self {
-        let constant_coefficient = Scalar::random(rng);
+    pub(crate) fn generate<R: RngCore + CryptoRng>(rng: &mut R, degree: u16, yes: bool) -> Self {
+        //let constant_coefficient = Scalar::random(rng);
+        let mut constant_coefficient = Scalar::ZERO;
+        if yes {
+            constant_coefficient = Scalar::ONE;
+        } else {
+            constant_coefficient = Scalar::ONE + Scalar::ONE;
+        }
 
         let mut non_constant_coefficients = Vec::new();
         for _ in 0..degree as usize - 2 {
-            non_constant_coefficients.push(Scalar::random(rng));
+            //non_constant_coefficients.push(Scalar::random(rng));
+            non_constant_coefficients.push(Scalar::ONE);
         }
 
         Self {
@@ -73,7 +80,7 @@ impl PolynomialCommitment {
         }
     }
 
-    pub(crate) fn evaluate(&self, identifier: Value) -> ValueCommitment {
+    pub(crate) fn evaluate(&self, identifier: &Value) -> ValueCommitment {
         let mut sum = RistrettoPoint::identity();
         let mut i_to_the_k = Scalar::ONE;
 
@@ -141,7 +148,7 @@ mod tests {
     fn test_generate_polynomial_commitment_valid() {
         let min_signers = 3;
 
-        let polynomial = Polynomial::generate(&mut OsRng, min_signers);
+        let polynomial = Polynomial::generate(&mut OsRng, min_signers, false);
 
         let polynomial_commitment = PolynomialCommitment::generate(&polynomial);
 
@@ -254,7 +261,7 @@ mod tests {
         // f(2) = 11
         let expected = Scalar::from(11u64) * GENERATOR;
 
-        let result = polynomial_commitment.evaluate(value);
+        let result = polynomial_commitment.evaluate(&value);
 
         assert_eq!(
             result.0,
