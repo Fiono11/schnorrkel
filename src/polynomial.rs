@@ -6,12 +6,12 @@ use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
 use zeroize::ZeroizeOnDrop;
 
-use crate::simplpedpop::GENERATOR;
+use crate::{points::Element, simplpedpop::GENERATOR};
 
 pub(crate) type Coefficient = Scalar;
 pub(crate) type Value = Scalar;
-pub(crate) type ValueCommitment = RistrettoPoint;
-pub(crate) type CoefficientCommitment = RistrettoPoint;
+pub(crate) type ValueCommitment = Element;
+pub(crate) type CoefficientCommitment = Element;
 
 /// A polynomial.
 #[derive(Debug, Clone, ZeroizeOnDrop)]
@@ -50,7 +50,7 @@ impl Polynomial {
 }
 
 /// A polynomial commitment.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PolynomialCommitment {
     pub(crate) constant_coefficient_commitment: CoefficientCommitment,
@@ -64,11 +64,11 @@ impl PolynomialCommitment {
         let non_constant_coefficients_commitments = polynomial
             .non_constant_coefficients
             .iter()
-            .map(|coefficient| GENERATOR * coefficient)
+            .map(|coefficient| Element((GENERATOR * coefficient).compress()))
             .collect();
 
         Self {
-            constant_coefficient_commitment: commitment,
+            constant_coefficient_commitment: Element(commitment.compress()),
             non_constant_coefficients_commitments,
         }
     }
@@ -77,14 +77,14 @@ impl PolynomialCommitment {
         let mut sum = RistrettoPoint::identity();
         let mut i_to_the_k = Scalar::ONE;
 
-        sum += self.constant_coefficient_commitment * i_to_the_k;
+        sum += self.constant_coefficient_commitment.0.decompress().unwrap() * i_to_the_k;
 
         for coefficient_commitment in &self.non_constant_coefficients_commitments {
             i_to_the_k *= identifier;
-            sum += coefficient_commitment * i_to_the_k;
+            sum += coefficient_commitment.0.decompress().unwrap() * i_to_the_k;
         }
 
-        sum
+        Element(sum.compress())
     }
 
     pub(crate) fn sum_polynomial_commitments(
@@ -99,21 +99,28 @@ impl PolynomialCommitment {
         let mut total_commitment = vec![RistrettoPoint::default(); max_length + 1];
 
         for polynomial_commitment in polynomials_commitments {
-            total_commitment[0] += polynomial_commitment.constant_coefficient_commitment;
+            total_commitment[0] += polynomial_commitment
+                .constant_coefficient_commitment
+                .0
+                .decompress()
+                .unwrap();
             for (i, coeff_commitment) in polynomial_commitment
                 .non_constant_coefficients_commitments
                 .iter()
                 .enumerate()
             {
                 if i < total_commitment.len() - 1 {
-                    total_commitment[i + 1] += coeff_commitment;
+                    total_commitment[i + 1] += coeff_commitment.0.decompress().unwrap();
                 }
             }
         }
 
         PolynomialCommitment {
-            constant_coefficient_commitment: total_commitment[0],
-            non_constant_coefficients_commitments: total_commitment[1..].to_vec(),
+            constant_coefficient_commitment: Element(total_commitment[0].compress()),
+            non_constant_coefficients_commitments: total_commitment[1..]
+                .iter()
+                .map(|x| Element(x.compress()))
+                .collect(),
         }
     }
 }
