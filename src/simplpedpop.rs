@@ -667,7 +667,6 @@ pub mod round3 {
         BTreeMap<Identifier, GroupPublicKeyShare>,
         PrivateData,
     )> {
-        println!("s: {:?}", round2_private_messages);
         round1_public_data.parameters.validate()?;
 
         round2_public_data
@@ -1037,9 +1036,7 @@ mod tests {
                     }
                 }
 
-                if !messages_for_participant.is_empty() {
-                    round2_private_messages.push(messages_for_participant);
-                }
+                round2_private_messages.push(messages_for_participant);
             }
 
             let result = round3::run(
@@ -1151,23 +1148,6 @@ mod tests {
                 "Expected DKGError::IncorrectNumberOfRound1PublicMessages."
             ),
         }
-    }
-
-    #[test]
-    fn test_encryption_decryption() {
-        let deckey = Scalar::random(&mut rand::thread_rng());
-        let enckey = RistrettoPoint::random(&mut rand::thread_rng());
-        let context = b"example context";
-
-        let original_share = SecretShare(Scalar::random(&mut rand::thread_rng()));
-
-        let encrypted_share = original_share.encrypt(&deckey, &enckey, context);
-        let decrypted_share = encrypted_share.decrypt(&deckey, &enckey, context);
-
-        assert_eq!(
-            original_share.0, decrypted_share.0,
-            "Decryption should return the original share"
-        );
     }
 
     #[test]
@@ -1485,7 +1465,7 @@ mod tests {
             .map(|msg| msg.private_messages().clone())
             .collect();
 
-        participants_round2_private_messages[0].pop_last();
+        participants_round2_private_messages[1].pop_last();
 
         let result = round3(
             &participants_sets_of_participants,
@@ -1529,5 +1509,22 @@ mod tests {
     fn test_threshold_greater_than_participants() {
         let parameters = Parameters::new(2, 3);
         assert_eq!(parameters.validate(), Err(DKGError::ExcessiveThreshold));
+    }
+
+    #[test]
+    fn test_encryption_decryption() {
+        let deckey = Scalar::random(&mut rand::thread_rng());
+        let enckey = RistrettoPoint::random(&mut rand::thread_rng());
+        let context = b"context";
+
+        let original_share = SecretShare(Scalar::random(&mut rand::thread_rng()));
+
+        let encrypted_share = original_share.encrypt(&deckey, &enckey, context);
+        let decrypted_share = encrypted_share.decrypt(&deckey, &enckey, context);
+
+        assert_eq!(
+            original_share.0, decrypted_share.0,
+            "Decryption must return the original share!"
+        );
     }
 }
