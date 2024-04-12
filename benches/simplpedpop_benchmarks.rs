@@ -10,66 +10,16 @@ mod simplpedpop_benches {
     use schnorrkel::{
         identifier::Identifier,
         simplpedpop::{
-            round1::{self, PrivateData, PrivateMessage, PublicData, PublicMessage},
-            round2, round3, Parameters,
+            round1::{self, PrivateData, PublicData, PublicMessage},
+            round2::{self, Messages},
+            round3, GroupPublicKey, GroupPublicKeyShare, Parameters, Participants,
         },
     };
 
     fn generate_parameters(max_signers: u16, min_signers: u16) -> Vec<Parameters> {
         (1..=max_signers)
-            .map(|i| {
-                let own_identifier = i.try_into().expect("should be nonzero");
-
-                let others_identifiers = (1..=max_signers)
-                    .filter_map(|j| {
-                        if j != i {
-                            Some(j.try_into().expect("should be nonzero"))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Parameters::new(max_signers, min_signers, own_identifier, others_identifiers)
-            })
+            .map(|_| Parameters::new(max_signers, min_signers))
             .collect()
-    }
-
-    fn round2(
-        participants: u16,
-        parameters_list: Vec<Parameters>,
-        participants_round1_private_data: Vec<PrivateData>,
-        participants_round1_public_data: Vec<PublicData>,
-        participants_round1_public_messages: Vec<BTreeMap<Identifier, PublicMessage>>,
-        participants_round1_private_messages: Vec<BTreeMap<Identifier, PrivateMessage>>,
-    ) -> (
-        Vec<round2::PublicData<Transcript>>,
-        Vec<round2::PublicMessage>,
-    ) {
-        let mut participants_round2_public_data = Vec::new();
-        let mut participants_round2_private_data = Vec::new();
-        let mut participants_round2_public_messages = Vec::new();
-
-        for i in 0..participants {
-            let result = round2::run(
-                &parameters_list[i as usize],
-                participants_round1_private_data[i as usize].clone(),
-                &participants_round1_public_data[i as usize].clone(),
-                &participants_round1_public_messages[i as usize].clone(),
-                participants_round1_private_messages[i as usize].clone(),
-                Transcript::new(b"transcript"),
-            )
-            .expect("Round 2 should complete without errors!");
-
-            participants_round2_public_data.push(result.0);
-            participants_round2_private_data.push(result.1);
-            participants_round2_public_messages.push(result.2);
-        }
-
-        (
-            participants_round2_public_data,
-            participants_round2_public_messages,
-        )
     }
 
     fn round1(
@@ -79,83 +29,100 @@ mod simplpedpop_benches {
         Vec<Parameters>,
         Vec<PrivateData>,
         Vec<PublicData>,
-        Vec<BTreeMap<Identifier, PublicMessage>>,
-        Vec<BTreeMap<Identifier, PrivateMessage>>,
-        BTreeSet<Identifier>,
+        Vec<BTreeSet<PublicMessage>>,
     ) {
         let parameters_list = generate_parameters(participants, threshold);
 
-        let mut all_public_messages = Vec::new();
-        let mut all_private_messages = Vec::new();
+        let mut all_public_messages_vec = Vec::new();
         let mut participants_round1_private_data = Vec::new();
         let mut participants_round1_public_data = Vec::new();
-        let mut participants_round1_messages = Vec::new();
 
-        for parameters in parameters_list.iter() {
-            let (private_data, messages, public_data) =
-                round1::run(parameters, OsRng).expect("Round 1 should complete without errors!");
+        for i in 0..parameters_list.len() {
+            let (private_data, public_message, public_data) =
+                round1::run(&parameters_list[i as usize], OsRng)
+                    .expect("Round 1 should complete without errors!");
 
-            all_public_messages.push((
-                parameters.own_identifier(),
-                messages.public_message().clone(),
-            ));
-            all_private_messages.push((
-                parameters.own_identifier(),
-                messages.private_messages().clone(),
-            ));
-            participants_round1_messages.push(messages);
-            participants_round1_private_data.push(private_data);
+            all_public_messages_vec.push(public_message.clone());
             participants_round1_public_data.push(public_data);
+            participants_round1_private_data.push(private_data);
         }
 
-        let mut participants_round1_public_messages: Vec<BTreeMap<Identifier, PublicMessage>> =
-            Vec::new();
-        let mut participants_round1_private_messages: Vec<BTreeMap<Identifier, PrivateMessage>> =
-            Vec::new();
+        let mut received_round1_public_messages: Vec<BTreeSet<PublicMessage>> = Vec::new();
 
-        let mut identifiers: BTreeSet<Identifier> = parameters_list[0]
-            .others_identifiers()
-            .iter()
-            .copied()
-            .collect();
+        let mut all_public_messages = BTreeSet::new();
 
-        identifiers.insert(*parameters_list[0].own_identifier());
+        for i in 0..participants {
+            all_public_messages.insert(all_public_messages_vec[i as usize].clone());
+        }
 
-        for identifier in &identifiers {
-            let mut all_public_msgs = BTreeMap::new();
-            let mut received_private_msgs = BTreeMap::new();
+        // Iterate through each participant to create a set of messages excluding their own.
+        for i in 0..participants as usize {
+            let own_message = PublicMessage::new(
+                participants_round1_public_data[i]
+                    .secret_polynomial_commitment()
+                    .clone(),
+                participants_round1_public_data[i]
+                    .proof_of_possession()
+                    .clone(),
+            );
 
-            for i in 0..participants {
-                all_public_msgs.insert(
-                    *all_public_messages[i as usize].0,
-                    all_public_messages[i as usize].1.clone(),
-                );
-            }
+            let mut messages_for_participant = BTreeSet::new();
 
-            participants_round1_public_messages.push(all_public_msgs);
-
-            for i in 0..participants {
-                if let Some(private_msg) = all_private_messages[i as usize].1.get(identifier) {
-                    received_private_msgs
-                        .insert(*all_private_messages[i as usize].0, private_msg.clone());
+            for message in &all_public_messages {
+                if &own_message != message {
+                    // Exclude the participant's own message.
+                    messages_for_participant.insert(message.clone());
                 }
             }
 
-            participants_round1_private_messages.push(received_private_msgs);
-        }
-
-        for i in 0..participants {
-            participants_round1_public_messages[i as usize]
-                .remove(&parameters_list[i as usize].own_identifier());
+            received_round1_public_messages.push(messages_for_participant);
         }
 
         (
             parameters_list,
             participants_round1_private_data,
             participants_round1_public_data,
-            participants_round1_public_messages,
-            participants_round1_private_messages,
-            identifiers,
+            received_round1_public_messages,
+        )
+    }
+
+    fn round2(
+        parameters_list: &Vec<Parameters>,
+        participants_round1_private_data: Vec<PrivateData>,
+        participants_round1_public_data: &Vec<PublicData>,
+        participants_round1_public_messages: &Vec<BTreeSet<PublicMessage>>,
+    ) -> (
+        Vec<round2::PublicData<Transcript>>,
+        Vec<Messages>,
+        Vec<Participants>,
+        Vec<Identifier>,
+    ) {
+        let mut participants_round2_public_data = Vec::new();
+        let mut participants_round2_public_messages = Vec::new();
+        let mut participants_set_of_participants = Vec::new();
+        let mut identifiers_vec = Vec::new();
+
+        for i in 0..*parameters_list[0].participants() {
+            let result = round2::run(
+                &parameters_list[i as usize],
+                participants_round1_private_data[i as usize].clone(),
+                &participants_round1_public_data[i as usize].clone(),
+                &participants_round1_public_messages[i as usize].clone(),
+                Transcript::new(b"simplpedpop"),
+            )
+            .expect("Round 2 should complete without errors!");
+
+            participants_round2_public_data.push(result.0.clone());
+            participants_round2_public_messages.push(result.1);
+            participants_set_of_participants.push(result.0.participants().clone());
+            identifiers_vec.push(*result.0.participants().own_identifier());
+        }
+
+        (
+            participants_round2_public_data,
+            participants_round2_public_messages,
+            participants_set_of_participants,
+            identifiers_vec,
         )
     }
 
@@ -183,8 +150,6 @@ mod simplpedpop_benches {
                 participants_round1_private_data,
                 participants_round1_public_data,
                 participants_round1_public_messages,
-                participants_round1_private_messages,
-                identifiers,
             ) = round1(participants, threshold);
 
             group.bench_function(BenchmarkId::new("round2", participants), |b| {
@@ -192,47 +157,83 @@ mod simplpedpop_benches {
                     round2::run(
                         &parameters_list[0],
                         participants_round1_private_data[0].clone(),
-                        &participants_round1_public_data[0].clone(),
-                        &participants_round1_public_messages[0].clone(),
-                        participants_round1_private_messages[0].clone(),
-                        Transcript::new(b"transcript"),
-                    )
-                    .unwrap();
-                })
-            });
-
-            let (participants_round2_public_data, participants_round2_public_messages) = round2(
-                participants,
-                parameters_list.clone(),
-                participants_round1_private_data.clone(),
-                participants_round1_public_data.clone(),
-                participants_round1_public_messages.clone(),
-                participants_round1_private_messages.clone(),
-            );
-
-            let identifiers_vec: Vec<Identifier> = identifiers.clone().iter().copied().collect();
-
-            let received_round2_public_messages = participants_round2_public_messages
-                .iter()
-                .enumerate()
-                .filter(|(index, _msg)| {
-                    identifiers_vec[*index] != *parameters_list[0].own_identifier()
-                })
-                .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
-                .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
-
-            group.bench_function(BenchmarkId::new("round3", participants), |b| {
-                b.iter(|| {
-                    round3::run(
-                        &parameters_list[0],
-                        &received_round2_public_messages,
-                        &participants_round2_public_data[0],
                         &participants_round1_public_data[0],
                         &participants_round1_public_messages[0],
+                        Transcript::new(b"simplpedpop"),
                     )
                     .unwrap();
                 })
             });
+
+            let (
+                participants_round2_public_data,
+                participants_round2_messages,
+                participants_sets_of_participants,
+                identifiers_vec,
+            ) = round2(
+                &parameters_list,
+                participants_round1_private_data.clone(),
+                &participants_round1_public_data,
+                &participants_round1_public_messages,
+            );
+
+            let participants_round2_public_messages: Vec<round2::PublicMessage> =
+                participants_round2_messages
+                    .iter()
+                    .map(|msg| msg.public_message().clone())
+                    .collect();
+
+            let participants_round2_private_messages: Vec<
+                BTreeMap<Identifier, round2::PrivateMessage>,
+            > = participants_round2_messages
+                .iter()
+                .map(|msg| msg.private_messages().clone())
+                .collect();
+
+            for i in 0..participants_sets_of_participants.len() {
+                let received_round2_public_messages = participants_round2_public_messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _msg)| {
+                        identifiers_vec[*index]
+                            != *participants_sets_of_participants[i as usize].own_identifier()
+                    })
+                    .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
+                    .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
+
+                let mut round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>> =
+                    Vec::new();
+
+                for participants in participants_sets_of_participants.iter() {
+                    let mut messages_for_participant = BTreeMap::new();
+
+                    for (i, round_messages) in
+                        participants_round2_private_messages.iter().enumerate()
+                    {
+                        if let Some(message) = round_messages.get(&participants.own_identifier()) {
+                            messages_for_participant.insert(identifiers_vec[i], message.clone());
+                        }
+                    }
+
+                    if !messages_for_participant.is_empty() {
+                        round2_private_messages.push(messages_for_participant);
+                    }
+                }
+
+                group.bench_function(BenchmarkId::new("round3", participants), |b| {
+                    b.iter(|| {
+                        round3::run(
+                            &received_round2_public_messages,
+                            &participants_round2_public_data[0],
+                            &participants_round1_public_data[0],
+                            participants_round1_private_data[0].clone(),
+                            round2_private_messages[0].clone(),
+                        )
+                        .unwrap();
+                    })
+                });
+                break;
+            }
         }
         group.finish();
     }
