@@ -8,6 +8,7 @@
 //! encrypted).
 
 use crate::{
+    context::SigningTranscript,
     errors::DKGError,
     identifier::Identifier,
     polynomial::{Coefficient, CoefficientCommitment, Polynomial, PolynomialCommitment, Value},
@@ -16,6 +17,7 @@ use crate::{
 use alloc::collections::BTreeSet;
 use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, RistrettoPoint, Scalar};
 use derive_getters::Getters;
+use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::ZeroizeOnDrop;
 
@@ -33,8 +35,34 @@ pub(crate) type Secret = Coefficient;
 
 /// A secret share, which corresponds to an evaluation of a value that identifies a participant in a secret polynomial.
 #[derive(Debug, Clone, ZeroizeOnDrop)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+//#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SecretShare(pub(crate) Value);
+
+impl SecretShare {
+    fn encrypt(&self, deckey: &Scalar, enckey: &RistrettoPoint, context: &[u8]) -> SecretShare {
+        let shared_secret = deckey * enckey;
+
+        let mut transcript = Transcript::new(b"encryption");
+
+        transcript.commit_point(b"shared secret", &shared_secret.compress());
+
+        transcript.append_message(b"context", context);
+
+        SecretShare(self.0 + transcript.challenge_scalar(b"ecdh"))
+    }
+
+    fn decrypt(&self, deckey: &Scalar, enckey: &RistrettoPoint, context: &[u8]) -> SecretShare {
+        let shared_secret = deckey * enckey;
+
+        let mut transcript = Transcript::new(b"encryption");
+
+        transcript.commit_point(b"shared secret", &shared_secret.compress());
+
+        transcript.append_message(b"context", context);
+
+        SecretShare(self.0 - transcript.challenge_scalar(b"ecdh"))
+    }
+}
 
 /// The parameters of a given execution of the SimplPedPoP protocol.
 #[derive(Debug, Clone, Getters)]
@@ -289,7 +317,7 @@ pub mod round2 {
         string::ToString,
         vec::Vec,
     };
-    use curve25519_dalek::Scalar;
+    use curve25519_dalek::{RistrettoPoint, Scalar};
     use derive_getters::Getters;
     use merlin::Transcript;
     use sha2::{digest::Update, Digest, Sha512};
@@ -314,13 +342,22 @@ pub mod round2 {
     #[derive(Debug, Clone, ZeroizeOnDrop, Getters)]
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct PrivateMessage {
-        pub(crate) secret_share: SecretShare,
+        pub(crate) encrypted_secret_share: SecretShare,
     }
 
     impl PrivateMessage {
         /// Creates a new private message.
-        pub fn new(secret_share: SecretShare) -> PrivateMessage {
-            PrivateMessage { secret_share }
+        pub fn new(
+            secret_share: SecretShare,
+            deckey: Scalar,
+            enckey: RistrettoPoint,
+            context: &[u8],
+        ) -> PrivateMessage {
+            let encrypted_secret_share = secret_share.encrypt(&deckey, &enckey, context);
+
+            PrivateMessage {
+                encrypted_secret_share,
+            }
         }
     }
 
@@ -367,6 +404,7 @@ pub mod round2 {
             .constant_coefficient_commitment;
 
         let messages = generate_messages(
+            &round1_public_messages,
             &public_data,
             &round1_private_data.secret_polynomial,
             round1_private_data.secret_key,
@@ -492,16 +530,35 @@ pub mod round2 {
     }
 
     fn generate_messages<T: SigningTranscript + Clone>(
+        round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round2_public_data: &PublicData<T>,
         secret_polynomial: &SecretPolynomial,
         secret_key: SecretKey,
         secret_commitment: &SecretCommitment,
     ) -> Messages {
         let mut private_messages = BTreeMap::new();
+        let enc_keys: Vec<RistrettoPoint> = round1_public_messages
+            .iter()
+            .map(|x| {
+                x.secret_polynomial_commitment
+                    .constant_coefficient_commitment
+                    .0
+                    .decompress()
+                    .unwrap()
+            })
+            .collect();
 
-        for identifier in &round2_public_data.participants.others_identifiers {
+        for (i, identifier) in round2_public_data
+            .participants
+            .others_identifiers
+            .iter()
+            .enumerate()
+        {
             let secret_share = secret_polynomial.evaluate(&identifier.0);
-            private_messages.insert(*identifier, PrivateMessage::new(SecretShare(secret_share)));
+            private_messages.insert(
+                *identifier,
+                PrivateMessage::new(SecretShare(secret_share), secret_key.key, enc_keys[i], b"a"),
+            );
         }
 
         let public_key = PublicKey::from_point(secret_commitment.0.decompress().unwrap());
@@ -536,7 +593,7 @@ pub mod round3 {
         collections::{BTreeMap, BTreeSet},
         vec::Vec,
     };
-    use curve25519_dalek::Scalar;
+    use curve25519_dalek::{RistrettoPoint, Scalar};
     use zeroize::ZeroizeOnDrop;
 
     /// The private data of round 3.
@@ -598,15 +655,16 @@ pub mod round3 {
             round2_public_data,
         )?;
 
-        verify_round2_private_messages(
+        let secret_shares = verify_round2_private_messages(
             &round2_public_data.participants,
             &round2_public_data.round1_public_messages,
             &round2_private_messages,
+            &round1_private_data.secret_key.key,
         )?;
 
         let private_data = generate_private_data(
             &round2_public_data.participants,
-            &round2_private_messages,
+            &secret_shares,
             &round1_private_data.secret_polynomial,
         )?;
 
@@ -656,12 +714,28 @@ pub mod round3 {
         participants: &Participants,
         round1_public_messages: &BTreeSet<round1::PublicMessage>,
         round2_private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
-    ) -> DKGResult<()> {
+        secret: &Scalar,
+    ) -> DKGResult<BTreeMap<Identifier, SecretShare>> {
+        let mut secret_shares = BTreeMap::new();
+
         let round1_public_messages: Vec<round1::PublicMessage> =
             round1_public_messages.iter().cloned().collect();
 
         for (i, (identifier, private_message)) in round2_private_messages.iter().enumerate() {
-            let expected_evaluation = GENERATOR * private_message.secret_share().0;
+            let secret_share = private_message.encrypted_secret_share().decrypt(
+                secret,
+                &round1_public_messages[i]
+                    .secret_polynomial_commitment()
+                    .constant_coefficient_commitment
+                    .0
+                    .decompress()
+                    .unwrap(),
+                b"a",
+            );
+
+            let expected_evaluation = GENERATOR * secret_share.0;
+
+            secret_shares.insert(*identifier, secret_share);
 
             let evaluation = round1_public_messages[i]
                 .secret_polynomial_commitment()
@@ -675,12 +749,12 @@ pub mod round3 {
             }
         }
 
-        Ok(())
+        Ok(secret_shares)
     }
 
     fn generate_private_data(
         participants: &Participants,
-        private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
+        secret_shares: &BTreeMap<Identifier, SecretShare>,
         secret_polynomial: &SecretPolynomial,
     ) -> DKGResult<PrivateData> {
         let own_secret_share = secret_polynomial.evaluate(&participants.own_identifier().0);
@@ -688,11 +762,7 @@ pub mod round3 {
         let mut total_secret_share = Scalar::ZERO;
 
         for id in participants.others_identifiers() {
-            total_secret_share += private_messages
-                .get(id)
-                .ok_or(DKGError::UnknownIdentifier)?
-                .secret_share()
-                .0;
+            total_secret_share += secret_shares.get(id).ok_or(DKGError::UnknownIdentifier)?.0;
         }
 
         total_secret_share += own_secret_share;
@@ -1043,6 +1113,23 @@ mod tests {
                 "Expected DKGError::IncorrectNumberOfRound1PublicMessages."
             ),
         }
+    }
+
+    #[test]
+    fn test_encryption_decryption() {
+        let deckey = Scalar::random(&mut rand::thread_rng());
+        let enckey = RistrettoPoint::random(&mut rand::thread_rng());
+        let context = b"example context";
+
+        let original_share = SecretShare(Scalar::random(&mut rand::thread_rng()));
+
+        let encrypted_share = original_share.encrypt(&deckey, &enckey, context);
+        let decrypted_share = encrypted_share.decrypt(&deckey, &enckey, context);
+
+        assert_eq!(
+            original_share.0, decrypted_share.0,
+            "Decryption should return the original share"
+        );
     }
 
     /*#[test]

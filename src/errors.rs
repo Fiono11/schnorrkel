@@ -229,4 +229,5 @@ pub enum DKGError {
         /// The actual value.
         actual: usize,
     },
+    EncryptionError,
 }
