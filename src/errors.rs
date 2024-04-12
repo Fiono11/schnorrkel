@@ -177,13 +177,6 @@ pub enum DKGError {
     InsufficientThreshold,
     /// Number of participants is invalid.
     InvalidNumberOfParticipants,
-    /// Incorrect number of coefficient commitments of the secret polynomial.
-    IncorrectNumberOfCoefficientCommitments {
-        /// The expected value.
-        expected: usize,
-        /// The actual value.
-        actual: usize,
-    },
     /// Secret share verification failed.
     InvalidSecretShare(Identifier),
     /// Invalid secret.
@@ -222,8 +215,8 @@ pub enum DKGError {
         /// The actual value.
         actual: usize,
     },
-    /// Incorrect number of polynomial commitments.
-    IncorrectNumberOfSecretPolynomialCommitments {
+    /// Incorrect number of round 2 private messages.
+    IncorrectNumberOfRound2PrivateMessages {
         /// The expected value.
         expected: usize,
         /// The actual value.

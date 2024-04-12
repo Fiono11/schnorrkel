@@ -12,7 +12,7 @@ mod simplpedpop_benches {
         simplpedpop::{
             round1::{self, PrivateData, PublicData, PublicMessage},
             round2::{self, Messages},
-            round3, GroupPublicKey, GroupPublicKeyShare, Parameters, Participants,
+            round3, Parameters, Participants,
         },
     };
 
