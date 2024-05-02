@@ -5,7 +5,8 @@
 use core::iter;
 use alloc::vec::Vec;
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT, ristretto::CompressedRistretto, RistrettoPoint, Scalar,
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::CompressedRistretto, traits::Identity,
+    RistrettoPoint, Scalar,
 };
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
@@ -57,6 +58,57 @@ pub fn identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
 }
 
 impl Keypair {
+    /// Encrypt a single scalar evaluation for a single recipient.
+    pub fn encrypt_secret_share(
+        &self,
+        recipient: &PublicKey,
+        scalar_evaluation: &Scalar,
+        nonce: &[u8; 16],
+    ) -> Scalar {
+        let mut rng = crate::getrandom_or_panic();
+
+        // Initialize the transcript for encryption
+        let mut transcript = Transcript::new(b"SingleScalarEncryption");
+        transcript.commit_point(b"contributor", &self.public.as_compressed());
+        transcript.commit_point(b"recipient", recipient.as_compressed());
+
+        transcript.append_message(b"nonce", nonce);
+
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &recipient);
+
+        // Derive a scalar from the transcript to use as the encryption key
+        let encryption_scalar = transcript.challenge_scalar(b"encryption scalar");
+        let encrypted_scalar = scalar_evaluation + encryption_scalar;
+
+        encrypted_scalar
+    }
+
+    /// Decrypt a single scalar evaluation for a single sender.
+    pub fn decrypt_secret_share(
+        &self,
+        sender: &PublicKey,
+        encrypted_scalar: &Scalar,
+        nonce: &[u8; 16],
+    ) -> Scalar {
+        // Initialize the transcript for decryption using the same setup as encryption
+        let mut transcript = Transcript::new(b"SingleScalarEncryption");
+        transcript.commit_point(b"contributor", sender.as_compressed());
+        transcript.commit_point(b"recipient", &self.public.as_compressed());
+
+        // Append the same nonce used during encryption
+        transcript.append_message(b"nonce", nonce);
+
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &sender);
+
+        // Derive the same scalar from the transcript used as the encryption key
+        let decryption_scalar = transcript.challenge_scalar(b"encryption scalar");
+
+        // Decrypt the scalar by reversing the addition
+        let original_scalar = encrypted_scalar - decryption_scalar;
+
+        original_scalar
+    }
+
     /// First round of the SimplPedPoP protocol.
     pub fn simplpedpop_contribute_all(
         &self,
@@ -97,7 +149,7 @@ impl Keypair {
         let point_polynomial: Vec<RistrettoPoint> =
             coefficients.iter().map(|c| RISTRETTO_BASEPOINT_POINT * *c).collect();
 
-        // All this custom encryption mess saves 32 bytes per recipiant
+        // All this custom encryption mess saves 32 bytes per recipient
         // over chacha20poly1305, so maybe not worth the trouble.
 
         let mut enc0 = merlin::Transcript::new(b"Encryption");
@@ -108,22 +160,15 @@ impl Keypair {
         rand_core::RngCore::fill_bytes(&mut rng, &mut encryption_nonce);
         enc0.append_message(b"nonce", &encryption_nonce);
 
-        let mut ciphertexts = scalar_evaluations;
+        let mut ciphertexts = scalar_evaluations.clone();
         for i in 0..parameters.participants {
-            let mut e = enc0.clone();
-            // We tweak by i too since encryption_nonce is not truly a nonce.
-            e.append_message(b"i", &i.to_le_bytes());
+            let ciphertext = self.encrypt_secret_share(
+                &recipients[i as usize],
+                &scalar_evaluations[i as usize],
+                &encryption_nonce,
+            );
 
-            e.commit_point(b"recipient", recipients[i as usize].as_compressed());
-            self.secret.commit_raw_key_exchange(&mut e, b"kex", &recipients[i as usize]);
-
-            // Afaik redundant for merlin, but attacks get better.
-            e.append_message(b"nonce", &encryption_nonce);
-
-            // As this is encryption, we require similar security properties
-            // as from witness_bytes here, but without randomness, and
-            // challenge_scalar is imeplemented close enough.
-            ciphertexts[i as usize] += e.challenge_scalar(b"encryption scalar");
+            ciphertexts.push(ciphertext);
         }
 
         let message_content = MessageContent {
@@ -149,6 +194,45 @@ impl Keypair {
             secret_key.sign(m, &PublicKey::from_point(secret_key.key * RISTRETTO_BASEPOINT_POINT));
 
         Ok(AllMessage { content: message_content, signature, proof_of_possession })
+    }
+
+    /// Second round of the SimplPedPoP protocol.
+    pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) -> DKGResult<()> {
+        let mut secret_shares = Vec::new();
+
+        for message in messages {
+            // Recreate the encryption environment
+            let mut enc = merlin::Transcript::new(b"Encryption");
+            message.content.parameters.commit(&mut enc);
+            enc.commit_point(b"contributor", message.content.sender.as_compressed());
+            let recipients_hash = message.content.recipients_hash;
+            let point_polynomial = &message.content.point_polynomial;
+            let sender = message.content.sender;
+
+            let encryption_nonce = message.content.encryption_nonce;
+            enc.append_message(b"nonce", &encryption_nonce);
+
+            for (i, ciphertext) in message.content.ciphertexts.iter().enumerate() {
+                let original_scalar =
+                    self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce);
+
+                if evaluate_secret_share(identifier(&recipients_hash, i as u16), &point_polynomial)
+                    == original_scalar * RISTRETTO_BASEPOINT_POINT
+                {
+                    println!("Found a valid secret share!");
+                    secret_shares.push(original_scalar);
+                    break;
+                }
+            }
+        }
+
+        if secret_shares.len() != messages[0].content.parameters.participants as usize {
+            return Err(DKGError::IncorrectNumberOfSecretShares {
+                expected: messages[0].content.parameters.participants as usize,
+                actual: secret_shares.len(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -307,11 +391,6 @@ impl AllMessage {
     }
 }
 
-impl Keypair {
-    /// Second round of the SimplPedPoP protocol.
-    pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) {}
-}
-
 /// Evaluate the polynomial with the given coefficients (constant term first)
 /// at the point x=identifier using Horner's method.
 fn evaluate_polynomial(identifier: &Scalar, coefficients: &[Scalar]) -> Scalar {
@@ -358,6 +437,17 @@ fn derive_secret_key_from_secret<R: RngCore + CryptoRng>(secret: &Scalar, mut rn
 
     SecretKey::from_bytes(&bytes[..])
         .expect("This never fails because bytes has length 64 and the key is a scalar")
+}
+
+fn evaluate_secret_share(identifier: Scalar, commitment: &Vec<RistrettoPoint>) -> RistrettoPoint {
+    let i = identifier;
+
+    let (_, result) = commitment
+        .iter()
+        .fold((Scalar::ONE, RistrettoPoint::identity()), |(i_to_the_k, sum_so_far), comm_k| {
+            (i * i_to_the_k, sum_so_far + comm_k * i_to_the_k)
+        });
+    result
 }
 
 #[cfg(test)]
@@ -448,5 +538,53 @@ mod tests {
         assert_eq!(message.proof_of_possession.s, deserialized_message.proof_of_possession.s);
         assert_eq!(message.signature.R, deserialized_message.signature.R);
         assert_eq!(message.signature.s, deserialized_message.signature.s);
+    }
+
+    #[test]
+    fn test_simplpedpop_protocol() {
+        // Create participants
+        let threshold = 2;
+        let participants = 2;
+        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
+        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
+
+        // Each participant creates an AllMessage
+        let mut all_messages = Vec::new();
+        for i in 0..participants {
+            let mut message: AllMessage =
+                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
+            all_messages.push(message);
+        }
+
+        // Each participant tries to decrypt all messages
+        for kp in keypairs.iter() {
+            kp.simplpedpop_recipient_all(&all_messages).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_scalar() {
+        // Create a sender and a recipient Keypair
+        let sender = Keypair::generate();
+        let recipient = Keypair::generate();
+
+        // Generate a scalar to encrypt
+        let original_scalar = Scalar::random(&mut OsRng);
+
+        let nonce = [0; 16];
+
+        // Encrypt the scalar using sender's keypair and recipient's public key
+        let encrypted_scalar =
+            sender.encrypt_secret_share(&recipient.public, &original_scalar, &nonce);
+
+        // Decrypt the scalar using recipient's keypair
+        let decrypted_scalar =
+            recipient.decrypt_secret_share(&sender.public, &encrypted_scalar, &nonce);
+
+        // Check that the decrypted scalar matches the original scalar
+        assert_eq!(
+            decrypted_scalar, original_scalar,
+            "Decrypted scalar should match the original scalar."
+        );
     }
 }

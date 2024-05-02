@@ -89,4 +89,11 @@ pub enum DKGError {
     InvalidRistrettoPoint,
     /// Deserialization Error.
     DeserializationError(TryFromSliceError),
+    /// Incorrect number secret shares.
+    IncorrectNumberOfSecretShares {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
 }
