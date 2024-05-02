@@ -167,7 +167,6 @@ impl Keypair {
 
         let mut ciphertexts = Vec::new();
         for i in 0..parameters.participants {
-            // implement real nonce
             let ciphertext = self.encrypt_secret_share(
                 &recipients[i as usize],
                 &scalar_evaluations[i as usize],
@@ -204,10 +203,12 @@ impl Keypair {
     }
 
     /// Second round of the SimplPedPoP protocol.
-    pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) -> DKGResult<()> {
+    pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) -> DKGResult<DKGOutput> {
         let mut secret_shares = Vec::new();
+        let mut verifying_keys = Vec::new();
 
         for message in messages {
+            let mut verifying_key = RistrettoPoint::identity();
             // Recreate the encryption environment
             let mut enc = merlin::Transcript::new(b"Encryption");
             message.content.parameters.commit(&mut enc);
@@ -223,13 +224,19 @@ impl Keypair {
                 let original_scalar =
                     self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce, i as usize);
 
-                if evaluate_secret_share(identifier(&recipients_hash, i as u16), &point_polynomial)
-                    == original_scalar * RISTRETTO_BASEPOINT_POINT
-                {
+                let evaluation = evaluate_secret_share(
+                    identifier(&recipients_hash, i as u16),
+                    &point_polynomial,
+                );
+
+                if evaluation == original_scalar * RISTRETTO_BASEPOINT_POINT {
+                    verifying_key += evaluation;
                     secret_shares.push(original_scalar);
                     break;
                 }
             }
+
+            verifying_keys.push(verifying_key);
         }
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
@@ -238,12 +245,32 @@ impl Keypair {
                 actual: secret_shares.len(),
             });
         }
-        Ok(())
+        let mut group_point = RistrettoPoint::identity();
+
+        for message in messages {
+            group_point += message
+                .content
+                .point_polynomial
+                .first()
+                .expect("This never fails because the minimum threshold is 2");
+        }
+
+        let dkg_output_content = DKGOutputContent {
+            group_public_key: PublicKey::from_point(group_point),
+            verifying_keys,
+        };
+
+        let keypair = Keypair::generate();
+        let mut transcript = Transcript::new(b"dkg output");
+        let signature = keypair.sign(transcript);
+
+        let dkg_output = DKGOutput { content: dkg_output_content, signature };
+
+        Ok(dkg_output)
     }
 }
 
 /// The contents of the message destined to all participants.
-#[derive(Clone)]
 pub struct MessageContent {
     sender: PublicKey,
     encryption_nonce: [u8; 16],
@@ -347,12 +374,82 @@ impl MessageContent {
     }
 }
 
+pub struct DKGOutput {
+    content: DKGOutputContent,
+    signature: Signature,
+}
+
+#[derive(Debug)]
+pub struct DKGOutputContent {
+    group_public_key: PublicKey,
+    verifying_keys: Vec<RistrettoPoint>,
+}
+
+impl DKGOutputContent {
+    /// Serializes the DKGOutputContent into bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Serialize the group public key
+        let compressed_public_key = self.group_public_key.as_compressed(); // Assuming PublicKey can be compressed directly
+        bytes.extend(compressed_public_key.to_bytes().iter());
+
+        // Serialize the number of verifying keys
+        let key_count = self.verifying_keys.len() as u16;
+        bytes.extend(key_count.to_le_bytes());
+
+        // Serialize each verifying key
+        for key in &self.verifying_keys {
+            let compressed_key = key.compress();
+            bytes.extend(compressed_key.to_bytes().iter());
+        }
+
+        bytes
+    }
+}
+
+impl DKGOutputContent {
+    /// Deserializes the DKGOutputContent from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<DKGOutputContent, DKGError> {
+        let mut cursor = 0;
+
+        // Deserialize the group public key
+        let public_key_bytes = &bytes[cursor..cursor + 32]; // Ristretto points are 32 bytes when compressed
+        cursor += 32;
+        let compressed_public_key = CompressedRistretto::from_slice(public_key_bytes)
+            .map_err(DKGError::DeserializationError)?;
+        let group_public_key =
+            compressed_public_key.decompress().ok_or(DKGError::InvalidRistrettoPoint)?;
+
+        // Deserialize the number of verifying keys
+        let key_count_bytes = &bytes[cursor..cursor + 2];
+        cursor += 2;
+        let key_count =
+            u16::from_le_bytes(key_count_bytes.try_into().map_err(DKGError::DeserializationError)?);
+
+        // Deserialize each verifying key
+        let mut verifying_keys = Vec::with_capacity(key_count as usize);
+        for _ in 0..key_count {
+            let key_bytes = &bytes[cursor..cursor + 32];
+            cursor += 32;
+            let compressed_key = CompressedRistretto::from_slice(key_bytes)
+                .map_err(DKGError::DeserializationError)?;
+            let key = compressed_key.decompress().ok_or(DKGError::InvalidRistrettoPoint)?;
+            verifying_keys.push(key);
+        }
+
+        Ok(DKGOutputContent {
+            group_public_key: PublicKey::from_point(group_public_key),
+            verifying_keys,
+        })
+    }
+}
+
 /// AllMessage packs together messages for all participants.
 ///
 /// We'd save bandwidth by having separate messages for each
 /// participant, but typical thresholds lie between 1/2 and 2/3,
 /// so this doubles or tripples bandwidth usage.
-#[derive(Clone)]
 pub struct AllMessage {
     content: MessageContent,
     proof_of_possession: Signature,
@@ -500,7 +597,7 @@ mod tests {
         let message = AllMessage { content: message_content, proof_of_possession, signature };
 
         // Serialize the message
-        let bytes = message.clone().to_bytes();
+        let bytes = message.to_bytes();
 
         // Deserialize the message
         let deserialized_message = AllMessage::from_bytes(&bytes).expect("Failed to deserialize");
@@ -559,14 +656,30 @@ mod tests {
         for i in 0..participants {
             let mut message: AllMessage =
                 keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
-            println!("message: {:?}", &message.content.ciphertexts);
             all_messages.push(message);
         }
 
+        let mut dkg_outputs = Vec::new();
+
         // Each participant tries to decrypt all messages
         for kp in keypairs.iter() {
-            kp.simplpedpop_recipient_all(&all_messages).unwrap();
+            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
+            dkg_outputs.push(dkg_output);
         }
+
+        // Assert that all DKG outputs are equal for group_public_key and verifying_keys
+        assert!(
+            dkg_outputs.windows(2).all(|w| w[0].content.group_public_key
+                == w[1].content.group_public_key
+                && w[0].content.verifying_keys.len() == w[1].content.verifying_keys.len()
+                && w[0]
+                    .content
+                    .verifying_keys
+                    .iter()
+                    .zip(w[1].content.verifying_keys.iter())
+                    .all(|(a, b)| a == b)),
+            "All DKG outputs should have identical group public keys and verifying keys."
+        );
     }
 
     #[test]
@@ -592,6 +705,51 @@ mod tests {
         assert_eq!(
             decrypted_scalar, original_scalar,
             "Decrypted scalar should match the original scalar."
+        );
+    }
+
+    #[test]
+    fn test_dkg_output_content_serialization() {
+        let mut rng = crate::getrandom_or_panic();
+        let group_public_key = RistrettoPoint::random(&mut rng);
+        let verifying_keys = vec![
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+        ];
+
+        let dkg_output = DKGOutputContent {
+            group_public_key: PublicKey::from_point(group_public_key),
+            verifying_keys,
+        };
+
+        // Serialize the DKGOutputContent
+        let bytes = dkg_output.to_bytes();
+
+        // Deserialize the DKGOutputContent
+        let deserialized_dkg_output =
+            DKGOutputContent::from_bytes(&bytes).expect("Deserialization failed");
+
+        // Check if the deserialized content matches the original
+        assert_eq!(
+            deserialized_dkg_output.group_public_key.as_compressed(),
+            dkg_output.group_public_key.as_compressed(),
+            "Group public keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.verifying_keys.len(),
+            dkg_output.verifying_keys.len(),
+            "Verifying keys counts do not match"
+        );
+
+        assert!(
+            deserialized_dkg_output
+                .verifying_keys
+                .iter()
+                .zip(dkg_output.verifying_keys.iter())
+                .all(|(a, b)| a == b),
+            "Verifying keys do not match"
         );
     }
 }
