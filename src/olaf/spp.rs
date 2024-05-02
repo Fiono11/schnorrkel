@@ -260,9 +260,8 @@ impl Keypair {
             verifying_keys,
         };
 
-        let keypair = Keypair::generate();
         let mut transcript = Transcript::new(b"dkg output");
-        let signature = keypair.sign(transcript);
+        let signature = self.sign(transcript);
 
         let dkg_output = DKGOutput { content: dkg_output_content, signature };
 
@@ -379,6 +378,37 @@ pub struct DKGOutput {
     signature: Signature,
 }
 
+impl DKGOutput {
+    /// Serializes the DKGOutput into bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Serialize the content
+        let content_bytes = self.content.to_bytes();
+        bytes.extend(content_bytes);
+
+        // Serialize the signature
+        let signature_bytes = self.signature.to_bytes();
+        bytes.extend(signature_bytes);
+
+        bytes
+    }
+
+    /// Deserializes the DKGOutput from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DKGError> {
+        let mut cursor = 0;
+        let content_bytes = &bytes[..bytes.len() - 64];
+        let content = DKGOutputContent::from_bytes(content_bytes)?;
+
+        cursor = bytes.len() - 64;
+        // Deserialize signature (Signature)
+        let signature = Signature::from_bytes(&bytes[cursor..cursor + 64])
+            .map_err(DKGError::InvalidSignature)?;
+
+        Ok(DKGOutput { content, signature })
+    }
+}
+
 #[derive(Debug)]
 pub struct DKGOutputContent {
     group_public_key: PublicKey,
@@ -401,7 +431,7 @@ impl DKGOutputContent {
         // Serialize each verifying key
         for key in &self.verifying_keys {
             let compressed_key = key.compress();
-            bytes.extend(compressed_key.to_bytes().iter());
+            bytes.extend(compressed_key.to_bytes());
         }
 
         bytes
@@ -709,8 +739,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dkg_output_content_serialization() {
-        let mut rng = crate::getrandom_or_panic();
+    fn test_dkg_output_serialization() {
+        let mut rng = OsRng;
         let group_public_key = RistrettoPoint::random(&mut rng);
         let verifying_keys = vec![
             RistrettoPoint::random(&mut rng),
@@ -718,38 +748,49 @@ mod tests {
             RistrettoPoint::random(&mut rng),
         ];
 
-        let dkg_output = DKGOutputContent {
+        let dkg_output_content = DKGOutputContent {
             group_public_key: PublicKey::from_point(group_public_key),
             verifying_keys,
         };
 
-        // Serialize the DKGOutputContent
+        let keypair = Keypair::generate();
+        let signature = keypair.sign(Transcript::new(b"test"));
+
+        let dkg_output = DKGOutput { content: dkg_output_content, signature };
+
+        // Serialize the DKGOutput
         let bytes = dkg_output.to_bytes();
 
-        // Deserialize the DKGOutputContent
+        // Deserialize the DKGOutput
         let deserialized_dkg_output =
-            DKGOutputContent::from_bytes(&bytes).expect("Deserialization failed");
+            DKGOutput::from_bytes(&bytes).expect("Deserialization failed");
 
         // Check if the deserialized content matches the original
         assert_eq!(
-            deserialized_dkg_output.group_public_key.as_compressed(),
-            dkg_output.group_public_key.as_compressed(),
+            deserialized_dkg_output.content.group_public_key.as_compressed(),
+            dkg_output.content.group_public_key.as_compressed(),
             "Group public keys do not match"
         );
 
         assert_eq!(
-            deserialized_dkg_output.verifying_keys.len(),
-            dkg_output.verifying_keys.len(),
+            deserialized_dkg_output.content.verifying_keys.len(),
+            dkg_output.content.verifying_keys.len(),
             "Verifying keys counts do not match"
         );
 
         assert!(
             deserialized_dkg_output
+                .content
                 .verifying_keys
                 .iter()
-                .zip(dkg_output.verifying_keys.iter())
+                .zip(dkg_output.content.verifying_keys.iter())
                 .all(|(a, b)| a == b),
             "Verifying keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.signature.s, dkg_output.signature.s,
+            "Signatures do not match"
         );
     }
 }
