@@ -1,5 +1,7 @@
 //! Errors of the Olaf protocol.
 
+use core::array::TryFromSliceError;
+
 use super::identifier::Identifier;
 use crate::SignatureError;
 
@@ -7,7 +9,7 @@ use crate::SignatureError;
 pub type DKGResult<T> = Result<T, DKGError>;
 
 /// An error ocurred during the execution of the SimplPedPoP protocol.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum DKGError {
     /// Invalid Proof of Possession.
     InvalidProofOfPossession(SignatureError),
@@ -77,4 +79,14 @@ pub enum DKGError {
         /// The actual value.
         actual: usize,
     },
+    /// Invalid PublicKey.
+    InvalidPublicKey(SignatureError),
+    /// Invalid Signature.
+    InvalidSignature(SignatureError),
+    /// Invalid Scalar.
+    InvalidScalar,
+    /// Invalid Ristretto Point.
+    InvalidRistrettoPoint,
+    /// Deserialization Error.
+    DeserializationError(TryFromSliceError),
 }
