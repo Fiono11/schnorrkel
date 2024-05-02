@@ -64,11 +64,14 @@ impl Keypair {
         recipient: &PublicKey,
         scalar_evaluation: &Scalar,
         nonce: &[u8; 16],
+        i: usize,
     ) -> Scalar {
         let mut rng = crate::getrandom_or_panic();
 
         // Initialize the transcript for encryption
         let mut transcript = Transcript::new(b"SingleScalarEncryption");
+        // We tweak by i too since encrypton_nonce is not truly a nonce.
+        transcript.append_message(b"i", &i.to_le_bytes());
         transcript.commit_point(b"contributor", &self.public.as_compressed());
         transcript.commit_point(b"recipient", recipient.as_compressed());
 
@@ -89,9 +92,11 @@ impl Keypair {
         sender: &PublicKey,
         encrypted_scalar: &Scalar,
         nonce: &[u8; 16],
+        i: usize,
     ) -> Scalar {
         // Initialize the transcript for decryption using the same setup as encryption
         let mut transcript = Transcript::new(b"SingleScalarEncryption");
+        transcript.append_message(b"i", &i.to_le_bytes());
         transcript.commit_point(b"contributor", sender.as_compressed());
         transcript.commit_point(b"recipient", &self.public.as_compressed());
 
@@ -157,15 +162,17 @@ impl Keypair {
         enc0.commit_point(b"contributor", self.public.as_compressed());
 
         let mut encryption_nonce = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rng, &mut encryption_nonce);
+        rng.fill_bytes(&mut encryption_nonce);
         enc0.append_message(b"nonce", &encryption_nonce);
 
-        let mut ciphertexts = scalar_evaluations.clone();
+        let mut ciphertexts = Vec::new();
         for i in 0..parameters.participants {
+            // implement real nonce
             let ciphertext = self.encrypt_secret_share(
                 &recipients[i as usize],
                 &scalar_evaluations[i as usize],
                 &encryption_nonce,
+                i as usize,
             );
 
             ciphertexts.push(ciphertext);
@@ -214,12 +221,11 @@ impl Keypair {
 
             for (i, ciphertext) in message.content.ciphertexts.iter().enumerate() {
                 let original_scalar =
-                    self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce);
+                    self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce, i as usize);
 
                 if evaluate_secret_share(identifier(&recipients_hash, i as u16), &point_polynomial)
                     == original_scalar * RISTRETTO_BASEPOINT_POINT
                 {
-                    println!("Found a valid secret share!");
                     secret_shares.push(original_scalar);
                     break;
                 }
@@ -553,6 +559,7 @@ mod tests {
         for i in 0..participants {
             let mut message: AllMessage =
                 keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
+            println!("message: {:?}", &message.content.ciphertexts);
             all_messages.push(message);
         }
 
@@ -575,11 +582,11 @@ mod tests {
 
         // Encrypt the scalar using sender's keypair and recipient's public key
         let encrypted_scalar =
-            sender.encrypt_secret_share(&recipient.public, &original_scalar, &nonce);
+            sender.encrypt_secret_share(&recipient.public, &original_scalar, &nonce, 0);
 
         // Decrypt the scalar using recipient's keypair
         let decrypted_scalar =
-            recipient.decrypt_secret_share(&sender.public, &encrypted_scalar, &nonce);
+            recipient.decrypt_secret_share(&sender.public, &encrypted_scalar, &nonce, 0);
 
         // Check that the decrypted scalar matches the original scalar
         assert_eq!(
