@@ -22,6 +22,7 @@ use curve25519_dalek::scalar::Scalar;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
+use crate::context::SigningTranscript;
 use crate::scalars;
 use crate::points::RistrettoBoth;
 use crate::errors::{SignatureError, SignatureResult};

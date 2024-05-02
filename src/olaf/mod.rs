@@ -7,3 +7,4 @@ pub mod keys;
 mod polynomial;
 pub mod simplpedpop;
 mod tests;
+pub mod spp;

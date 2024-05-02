@@ -40,6 +40,7 @@ zeroize = { version = "1.6", default-features = false, features = [
 derive-getters = "0.3.0"
 chacha20poly1305 = { version = "0.10.1", default-features = false }
 hex = { version = "0.4", default-features = true, optional = true }
+thiserror = { version = "1.0", default-features = false, optional = true }
 
 [dev-dependencies]
 rand = "0.8.5"
@@ -67,6 +68,7 @@ std = [
     "getrandom_or_panic/std",
     "chacha20poly1305/std",
     "hex/std",
+    "thiserror",
 ]
 default = ["std", "getrandom"]
 preaudit_deprecated = []
