@@ -66,8 +66,6 @@ impl Keypair {
         nonce: &[u8; 16],
         i: usize,
     ) -> Scalar {
-        let mut rng = crate::getrandom_or_panic();
-
         // Initialize the transcript for encryption
         let mut transcript = Transcript::new(b"SingleScalarEncryption");
         // We tweak by i too since encrypton_nonce is not truly a nonce.
@@ -203,14 +201,18 @@ impl Keypair {
     }
 
     /// Second round of the SimplPedPoP protocol.
-    pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) -> DKGResult<DKGOutput> {
+    pub fn simplpedpop_recipient_all(
+        &self,
+        messages: &[AllMessage],
+    ) -> DKGResult<(DKGOutput, Scalar)> {
         let mut secret_shares = Vec::new();
-        let mut verifying_keys = Vec::new();
+        let mut verifying_keys = [RistrettoPoint::identity(); 2];
         let mut transcript = Transcript::new(b"dkg output");
         let mut identified = false;
 
+        assert!(messages.len() == 2);
+
         for message in messages {
-            let mut verifying_key = RistrettoPoint::identity();
             // Recreate the encryption environment
             let mut enc = merlin::Transcript::new(b"Encryption");
             message.content.parameters.commit(&mut enc);
@@ -222,6 +224,8 @@ impl Keypair {
             let encryption_nonce = message.content.encryption_nonce;
             enc.append_message(b"nonce", &encryption_nonce);
 
+            assert!(message.content.ciphertexts.len() == 2);
+
             for (i, ciphertext) in message.content.ciphertexts.iter().enumerate() {
                 let original_scalar =
                     self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce, i as usize);
@@ -231,20 +235,24 @@ impl Keypair {
                     &point_polynomial,
                 );
 
+                verifying_keys[i] += evaluation;
+
                 if evaluation == original_scalar * RISTRETTO_BASEPOINT_POINT {
                     if !identified {
                         // This is to distinguish different output messages in the case that recipients != participants
                         transcript.append_u64(b"id", i as u64);
                         identified = true;
                     }
-                    verifying_key += evaluation;
                     secret_shares.push(original_scalar);
-                    break;
                 }
             }
-
-            verifying_keys.push(verifying_key);
         }
+
+        for verifying_key in &verifying_keys {
+            assert!(*verifying_key != RistrettoPoint::identity());
+        }
+
+        assert!(verifying_keys.len() == messages[0].content.parameters.participants as usize);
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
             return Err(DKGError::IncorrectNumberOfSecretShares {
@@ -252,6 +260,13 @@ impl Keypair {
                 actual: secret_shares.len(),
             });
         }
+
+        let mut total_secret_share = Scalar::ZERO;
+
+        for secret_share in secret_shares {
+            total_secret_share += secret_share;
+        }
+
         let mut group_point = RistrettoPoint::identity();
 
         for message in messages {
@@ -264,14 +279,14 @@ impl Keypair {
 
         let dkg_output_content = DKGOutputContent {
             group_public_key: PublicKey::from_point(group_point),
-            verifying_keys,
+            verifying_keys: verifying_keys.to_vec(),
         };
 
         let signature = self.sign(transcript);
 
         let dkg_output = DKGOutput { sender: self.public, content: dkg_output_content, signature };
 
-        Ok(dkg_output)
+        Ok((dkg_output, total_secret_share))
     }
 }
 
@@ -606,33 +621,20 @@ mod tests {
     use curve25519_dalek::scalar::Scalar;
     use rand::rngs::OsRng;
 
-    // Helper function to create a test PublicKey
-    fn test_public_key() -> PublicKey {
-        let point = RistrettoPoint::random(&mut OsRng);
-        PublicKey::from_point(point)
-    }
-
-    // Helper function to create a test Signature
-    fn test_signature() -> Signature {
-        let point = RistrettoPoint::random(&mut OsRng);
-        let scalar = Scalar::random(&mut OsRng);
-        Signature { R: point.compress(), s: scalar }
-    }
-
     #[test]
     fn test_serialize_deserialize() {
-        let sender = test_public_key();
+        let sender = Keypair::generate();
         let encryption_nonce = [1u8; 16];
         let parameters = Parameters { participants: 2, threshold: 1 };
         let recipients_hash = [2u8; 16];
         let point_polynomial =
             vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
         let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
-        let proof_of_possession = test_signature();
-        let signature = test_signature();
+        let proof_of_possession = sender.sign(Transcript::new(b"pop"));
+        let signature = sender.sign(Transcript::new(b"sig"));
 
         let message_content = MessageContent {
-            sender,
+            sender: sender.public,
             encryption_nonce,
             parameters,
             recipients_hash,
@@ -700,14 +702,13 @@ mod tests {
         // Each participant creates an AllMessage
         let mut all_messages = Vec::new();
         for i in 0..participants {
-            let mut message: AllMessage =
+            let message: AllMessage =
                 keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
             all_messages.push(message);
         }
 
         let mut dkg_outputs = Vec::new();
 
-        // Each participant tries to decrypt all messages
         for kp in keypairs.iter() {
             let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
             dkg_outputs.push(dkg_output);
@@ -715,17 +716,28 @@ mod tests {
 
         // Assert that all DKG outputs are equal for group_public_key and verifying_keys
         assert!(
-            dkg_outputs.windows(2).all(|w| w[0].content.group_public_key
-                == w[1].content.group_public_key
-                && w[0].content.verifying_keys.len() == w[1].content.verifying_keys.len()
+            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
+                == w[1].0.content.group_public_key
+                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
                 && w[0]
+                    .0
                     .content
                     .verifying_keys
                     .iter()
-                    .zip(w[1].content.verifying_keys.iter())
+                    .zip(w[1].0.content.verifying_keys.iter())
                     .all(|(a, b)| a == b)),
             "All DKG outputs should have identical group public keys and verifying keys."
         );
+
+        for i in 0..participants {
+            for j in 0..participants {
+                assert_eq!(
+                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
+                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
+                    "Verification of total secret shares failed!"
+                );
+            }
+        }
     }
 
     #[test]
