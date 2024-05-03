@@ -1,943 +1,527 @@
-//! Implementation of a modified version of SimplPedPoP (<https://eprint.iacr.org/2023/899>), a DKG based on PedPoP, which in turn is based
+//! Implementation of the SimplPedPoP protocol (<https://eprint.iacr.org/2023/899>), a DKG based on PedPoP, which in turn is based
 //! on Pedersen's DKG. All of them have as the fundamental building block the Shamir's Secret Sharing scheme.
-//!
-//! The modification consists of each participant sending the secret shares of the other participants only in round 2
-//! instead of in round 1. The reason for this is we use the secret commitments (the evaluations of the secret polynomial
-//! commitments at zero) of round 1 to assign the identifiers of all the participants in round 2, which will then be
-//! used to compute the corresponding secret shares. Finally, we encrypt and authenticate the secret shares with
-//! Chacha20Poly1305, meaning they can be distributed to the participants by an untrusted coordinator instead of sending
-//! them directly.
-//!
-//! The protocol is divided into three rounds. In each round some data and some messages are produced and some messages
-//! are verified (if received from a previous round). Data is divided into public and private because in a given round we
-//! want to pass a reference to the public data (performance reasons) and the private data itself so that it is zeroized
-//! after getting out of scope (security reasons). Public messages are destined to all the other participants, while private
-//! messages are destined to a single participant.
 
-use crate::{context::SigningTranscript, SecretKey, Signature};
-use aead::{generic_array::GenericArray, KeyInit, KeySizeUser};
-use alloc::{collections::BTreeSet, vec::Vec};
-use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
-use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, RistrettoPoint, Scalar};
-use derive_getters::Getters;
+use alloc::vec::Vec;
+use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
-use rand_core::{CryptoRng, RngCore};
-use zeroize::ZeroizeOnDrop;
-
+use rand_core::RngCore;
+use crate::{context::SigningTranscript, olaf::data_structures::Identifier, Keypair, PublicKey};
 use super::{
+    data_structures::{AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters},
     errors::{DKGError, DKGResult},
-    identifier::Identifier,
-    polynomial::{Coefficient, CoefficientCommitment, Polynomial, PolynomialCommitment},
+    utils::{
+        derive_secret_key_from_secret, evaluate_polynomial, evaluate_secret_share,
+        generate_coefficients,
+    },
 };
 
-pub(crate) const GENERATOR: RistrettoPoint = RISTRETTO_BASEPOINT_POINT;
-
-pub(crate) type SecretPolynomialCommitment = PolynomialCommitment;
-pub(crate) type SecretPolynomial = Polynomial;
-pub(crate) type TotalSecretShare = SecretShare;
-pub(crate) type SecretCommitment = CoefficientCommitment;
-pub(crate) type Certificate = Signature;
-pub(crate) type ProofOfPossession = Signature;
-pub(crate) type Secret = Coefficient;
-
-/// The parameters of a given execution of the SimplPedPoP protocol.
-#[derive(Debug, Clone, Getters)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Parameters {
-    pub(crate) participants: u16,
-    pub(crate) threshold: u16,
-}
-
-impl Parameters {
-    /// Create new parameters.
-    pub fn new(participants: u16, threshold: u16) -> Parameters {
-        Parameters { participants, threshold }
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), DKGError> {
-        if self.threshold < 2 {
-            return Err(DKGError::InsufficientThreshold);
-        }
-
-        if self.participants < 2 {
-            return Err(DKGError::InvalidNumberOfParticipants);
-        }
-
-        if self.threshold > self.participants {
-            return Err(DKGError::ExcessiveThreshold);
-        }
-
-        Ok(())
-    }
-}
-
-/// The participants of a given execution of the SimplPedPoP protocol.
-#[derive(Debug, Clone, Getters)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Identifiers {
-    pub(crate) own_identifier: Identifier,
-    pub(crate) others_identifiers: BTreeSet<Identifier>,
-}
-
-impl Identifiers {
-    /// Create new participants.
-    pub fn new(
-        own_identifier: Identifier,
-        others_identifiers: BTreeSet<Identifier>,
-    ) -> Identifiers {
-        Identifiers { own_identifier, others_identifiers }
-    }
-
-    pub(crate) fn validate(&self, participants: u16) -> Result<(), DKGError> {
-        if self.own_identifier.0 == Scalar::ZERO {
-            return Err(DKGError::InvalidIdentifier);
-        }
-
-        for other_identifier in &self.others_identifiers {
-            if other_identifier.0 == Scalar::ZERO {
-                return Err(DKGError::InvalidIdentifier);
-            }
-        }
-
-        if self.others_identifiers.len() != participants as usize - 1 {
-            return Err(DKGError::IncorrectNumberOfIdentifiers {
-                expected: participants as usize,
-                actual: self.others_identifiers.len() + 1,
-            });
-        }
-
-        Ok(())
-    }
-}
-
-fn derive_secret_key_from_secret<R: RngCore + CryptoRng>(secret: &Secret, mut rng: R) -> SecretKey {
-    let mut bytes = [0u8; 64];
-    let mut nonce: [u8; 32] = [0u8; 32];
-
-    rng.fill_bytes(&mut nonce);
-    let secret_bytes = secret.to_bytes();
-
-    bytes[..32].copy_from_slice(&secret_bytes[..]);
-    bytes[32..].copy_from_slice(&nonce[..]);
-
-    SecretKey::from_bytes(&bytes[..])
-        .expect("This never fails because bytes has length 64 and the key is a scalar")
-}
-
-/// A secret share, which corresponds to an evaluation of a value that identifies a participant in a secret polynomial.
-#[derive(Debug, Clone, ZeroizeOnDrop)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SecretShare(pub(crate) Scalar);
-
-impl SecretShare {
-    pub(crate) fn encrypt(
+impl Keypair {
+    /// Encrypt a single scalar evaluation for a single recipient.
+    pub fn encrypt_secret_share<T: SigningTranscript>(
         &self,
-        decryption_key: &Scalar,
-        encryption_key: &RistrettoPoint,
-        context: &[u8],
-    ) -> DKGResult<EncryptedSecretShare> {
-        let shared_secret = decryption_key * encryption_key;
+        mut transcript: T,
+        recipient: &PublicKey,
+        scalar_evaluation: &Scalar,
+        nonce: &[u8; 16],
+        i: usize,
+    ) -> Scalar {
+        transcript.commit_bytes(b"i", &i.to_le_bytes());
+        transcript.commit_point(b"contributor", &self.public.as_compressed());
+        transcript.commit_point(b"recipient", recipient.as_compressed());
 
-        let mut transcript = Transcript::new(b"encryption");
-        transcript.commit_point(b"shared secret", &shared_secret.compress());
-        transcript.append_message(b"context", context);
+        transcript.commit_bytes(b"nonce", nonce);
 
-        let mut bytes = [0; 12];
-        transcript.challenge_bytes(b"nonce", &mut bytes);
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &recipient);
 
-        let nonce = Nonce::from_slice(&bytes[..]);
+        // Derive a scalar from the transcript to use as the encryption key
+        let encryption_scalar = transcript.challenge_scalar(b"encryption scalar");
+        let encrypted_scalar = scalar_evaluation + encryption_scalar;
 
-        let mut key: GenericArray<
-            u8,
-            <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize,
-        > = Default::default();
-
-        transcript.challenge_bytes(b"", key.as_mut_slice());
-
-        let cipher = ChaCha20Poly1305::new(&key);
-
-        let ciphertext: Vec<u8> = cipher
-            .encrypt(nonce, &self.0.as_bytes()[..])
-            .map_err(DKGError::EncryptionError)?;
-
-        Ok(EncryptedSecretShare(ciphertext))
+        encrypted_scalar
     }
-}
 
-/// An encrypted secret share, which can be sent directly to the intended participant or through an untrusted coordinator.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct EncryptedSecretShare(pub(crate) Vec<u8>);
-
-impl EncryptedSecretShare {
-    pub(crate) fn decrypt(
+    /// Decrypt a single scalar evaluation for a single sender.
+    pub fn decrypt_secret_share<T: SigningTranscript>(
         &self,
-        decryption_key: &Scalar,
-        encryption_key: &RistrettoPoint,
-        context: &[u8],
-    ) -> DKGResult<SecretShare> {
-        let shared_secret = decryption_key * encryption_key;
+        mut transcript: T,
+        sender: &PublicKey,
+        encrypted_scalar: &Scalar,
+        nonce: &[u8; 16],
+        i: usize,
+    ) -> Scalar {
+        transcript.commit_bytes(b"i", &i.to_le_bytes());
+        transcript.commit_point(b"contributor", sender.as_compressed());
+        transcript.commit_point(b"recipient", &self.public.as_compressed());
 
-        let mut transcript = Transcript::new(b"encryption");
-        transcript.commit_point(b"shared secret", &shared_secret.compress());
-        transcript.append_message(b"context", context);
+        // Append the same nonce used during encryption
+        transcript.commit_bytes(b"nonce", nonce);
 
-        let mut bytes = [0; 12];
-        transcript.challenge_bytes(b"nonce", &mut bytes);
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &sender);
 
-        let nonce = Nonce::from_slice(&bytes);
+        // Derive the same scalar from the transcript used as the encryption key
+        let decryption_scalar = transcript.challenge_scalar(b"encryption scalar");
 
-        let mut key: GenericArray<
-            u8,
-            <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize,
-        > = Default::default();
+        // Decrypt the scalar by reversing the addition
+        let original_scalar = encrypted_scalar - decryption_scalar;
 
-        transcript.challenge_bytes(b"", key.as_mut_slice());
-
-        let cipher = ChaCha20Poly1305::new(&key);
-
-        let plaintext = cipher.decrypt(nonce, &self.0[..]).map_err(DKGError::DecryptionError)?;
-
-        let mut bytes = [0; 32];
-        bytes.copy_from_slice(&plaintext);
-
-        Ok(SecretShare(Scalar::from_bytes_mod_order(bytes)))
-    }
-}
-
-/// SimplPedPoP round 1.
-///
-/// The participant commits to a secret polynomial f(x) of degree t-1, where t is the threshold of the DKG, by commiting
-/// to each one of the t coefficients of the secret polynomial.
-///
-/// It derives a secret key from the secret of the polynomial f(0) and uses it to generate a Proof of Possession of that
-/// secret by signing a message with the secret key.
-pub mod round1 {
-    use super::{
-        derive_secret_key_from_secret, Parameters, ProofOfPossession, SecretPolynomial,
-        SecretPolynomialCommitment,
-    };
-    use crate::{
-        olaf::errors::DKGResult,
-        olaf::polynomial::{Polynomial, PolynomialCommitment},
-        PublicKey, SecretKey,
-    };
-    use core::cmp::Ordering;
-    use curve25519_dalek::Scalar;
-    use merlin::Transcript;
-    use rand_core::{CryptoRng, RngCore};
-
-    /// The private data generated by the participant in round 1.
-    #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PrivateData {
-        pub(crate) secret_key: SecretKey,
-        pub(crate) secret_polynomial: SecretPolynomial,
+        original_scalar
     }
 
-    /// The public data generated by the participant in round 1.
-    #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PublicData {
-        pub(crate) parameters: Parameters,
-        pub(crate) secret_polynomial_commitment: SecretPolynomialCommitment,
-        pub(crate) proof_of_possession: ProofOfPossession,
-    }
-
-    /// Public message to be sent by the participant to all the other participants or to the coordinator in round 1.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PublicMessage {
-        pub(crate) secret_polynomial_commitment: SecretPolynomialCommitment,
-        pub(crate) proof_of_possession: ProofOfPossession,
-    }
-
-    impl PublicMessage {
-        /// Creates a new public message.
-        pub fn new(public_data: &PublicData) -> PublicMessage {
-            PublicMessage {
-                secret_polynomial_commitment: public_data.secret_polynomial_commitment.clone(),
-                proof_of_possession: public_data.proof_of_possession,
-            }
-        }
-    }
-
-    impl PartialOrd for PublicMessage {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    impl Ord for PublicMessage {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.secret_polynomial_commitment
-                .coefficients_commitments
-                .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2")
-                .compress()
-                .0
-                .cmp(
-                    &other
-                        .secret_polynomial_commitment
-                        .coefficients_commitments
-                        .first()
-                        .expect(
-                            "This never fails because the minimum threshold of the protocol is 2",
-                        )
-                        .compress()
-                        .0,
-                )
-        }
-    }
-
-    /// Runs the round 1 of the SimplPedPoP protocol.
-    pub fn run<R: RngCore + CryptoRng>(
-        parameters: Parameters,
-        mut rng: R,
-    ) -> DKGResult<(PrivateData, PublicMessage, PublicData)> {
+    /// First round of the SimplPedPoP protocol.
+    pub fn simplpedpop_contribute_all(
+        &self,
+        threshold: u16,
+        recipients: Vec<PublicKey>,
+    ) -> DKGResult<AllMessage> {
+        let parameters = Parameters::generate(threshold, recipients.len() as u16);
         parameters.validate()?;
 
-        let (private_data, public_data) = generate_data(parameters, &mut rng);
+        let mut rng = crate::getrandom_or_panic();
 
-        let public_message = PublicMessage::new(&public_data);
+        // We do not  recipiants.sort() because the protocol is simpler
+        // if we require that all contributions provide the list in
+        // exactly the same order.
+        //
+        // Instead we create a kind of session id by hashing the list
+        // provided, but we provide only hash to recipiants, not the
+        // full recipiants list.
+        let mut t = merlin::Transcript::new(b"RecipientsHash");
+        parameters.commit(&mut t);
+        for r in recipients.iter() {
+            t.commit_point(b"recipient", r.as_compressed());
+        }
+        let mut recipients_hash = [0u8; 16];
+        t.challenge_bytes(b"finalize", &mut recipients_hash);
 
-        Ok((private_data, public_message, public_data))
-    }
+        // uses identifier(recipients_hash, i)
+        let coefficients = generate_coefficients(parameters.threshold as usize - 1, &mut rng);
+        let mut scalar_evaluations = Vec::new();
 
-    fn generate_data<R: RngCore + CryptoRng>(
-        parameters: Parameters,
-        mut rng: R,
-    ) -> (PrivateData, PublicData) {
-        let secret_polynomial = loop {
-            let temp_polynomial = Polynomial::generate(&mut rng, *parameters.threshold() - 1);
-            // There must be a secret, which is the constant coefficient of the secret polynomial
-            if temp_polynomial
-                .coefficients
+        for i in 0..parameters.participants {
+            let identifier = Identifier::generate(&recipients_hash, i);
+            let scalar_evaluation = evaluate_polynomial(&identifier.0, &coefficients);
+            scalar_evaluations.push(scalar_evaluation);
+        }
+
+        // Create the vector of commitments
+        let point_polynomial: Vec<RistrettoPoint> =
+            coefficients.iter().map(|c| RISTRETTO_BASEPOINT_POINT * *c).collect();
+
+        // All this custom encryption mess saves 32 bytes per recipient
+        // over chacha20poly1305, so maybe not worth the trouble.
+
+        let mut enc0 = merlin::Transcript::new(b"Encryption");
+        parameters.commit(&mut enc0);
+        enc0.commit_point(b"contributor", self.public.as_compressed());
+
+        let mut encryption_nonce = [0u8; 16];
+        rng.fill_bytes(&mut encryption_nonce);
+        enc0.append_message(b"nonce", &encryption_nonce);
+
+        let mut ciphertexts = Vec::new();
+        for i in 0..parameters.participants {
+            let ciphertext = self.encrypt_secret_share(
+                enc0.clone(),
+                &recipients[i as usize],
+                &scalar_evaluations[i as usize],
+                &encryption_nonce,
+                i as usize,
+            );
+
+            ciphertexts.push(ciphertext);
+        }
+
+        let pk = &PublicKey::from_point(
+            *point_polynomial
                 .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2")
-                != &Scalar::ZERO
-            {
-                break temp_polynomial;
-            }
-        };
+                .expect("This never fails because the minimum threshold is 2"),
+        );
 
-        let secret_polynomial_commitment = PolynomialCommitment::commit(&secret_polynomial);
+        let message_content = MessageContent::new(
+            self.public,
+            encryption_nonce,
+            parameters,
+            recipients_hash,
+            point_polynomial,
+            ciphertexts,
+        );
 
-        // This secret key will be used to sign the proof of possession and the certificate
+        let mut m = Transcript::new(b"signature");
+        m.append_message(b"message", &message_content.to_bytes());
+
+        let signature = self.sign(m.clone());
         let secret_key = derive_secret_key_from_secret(
-            secret_polynomial
-                .coefficients
+            coefficients
                 .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2"),
-            rng,
+                .expect("This never fails because the minimum threshold is 2"),
+            &mut rng,
         );
+        let proof_of_possession = secret_key.sign(m, pk);
 
-        let public_key = PublicKey::from_point(
-            *secret_polynomial_commitment
-                .coefficients_commitments
-                .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2"),
-        );
-
-        let proof_of_possession =
-            secret_key.sign(Transcript::new(b"Proof of Possession"), &public_key);
-
-        (
-            PrivateData { secret_key, secret_polynomial },
-            PublicData { parameters, secret_polynomial_commitment, proof_of_possession },
-        )
-    }
-}
-
-/// SimplPedPoP round 2.
-///
-/// The participant verifies the received messages of the other participants from round 1, the secret polynomial commitments
-/// and the Proofs of Possession.
-///
-/// It orders the secret commitments and uses that ordering to assing random identifiers to all the participants in the
-/// protocol, including its own.
-///
-/// It computes the secret shares of each participant based on their identifiers, encrypts and authenticates them using
-/// Chacha20Poly1305 with a shared secret.
-///
-/// It signs a transcript of the protocol execution (certificate) with its secret key, which contains the PoPs and the
-/// polynomial commitments from all the participants (including its own).
-pub mod round2 {
-    use super::{
-        round1, Certificate, EncryptedSecretShare, Identifier, Identifiers, Parameters,
-        SecretCommitment, SecretPolynomial, SecretShare,
-    };
-    use crate::{
-        context::SigningTranscript,
-        olaf::errors::{DKGError, DKGResult},
-        verify_batch, PublicKey, SecretKey,
-    };
-    use alloc::{
-        collections::{BTreeMap, BTreeSet},
-        string::ToString,
-        vec,
-        vec::Vec,
-    };
-    use curve25519_dalek::{RistrettoPoint, Scalar};
-    use derive_getters::Getters;
-    use merlin::Transcript;
-    use sha2::{digest::Update, Digest, Sha512};
-
-    /// The public data of round 2.
-    #[derive(Debug, Clone, Getters)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PublicData {
-        pub(crate) identifiers: Identifiers,
-        pub(crate) round1_public_messages: BTreeMap<Identifier, round1::PublicMessage>,
-        pub(crate) transcript: Scalar,
-        pub(crate) public_keys: Vec<PublicKey>,
+        Ok(AllMessage::new(message_content, proof_of_possession, signature))
     }
 
-    /// The public message of round 2.
-    #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PublicMessage {
-        pub(crate) certificate: Certificate,
-    }
+    /// Second round of the SimplPedPoP protocol.
+    pub fn simplpedpop_recipient_all(
+        &self,
+        messages: &[AllMessage],
+    ) -> DKGResult<(DKGOutput, Scalar)> {
+        // It's irrelevant if we're in the recipiants or not ???
 
-    /// Private message to sent by a participant to another participant or to the coordinator in encrypted form in round 1.
-    #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PrivateMessage {
-        pub(crate) encrypted_secret_share: EncryptedSecretShare,
-    }
+        let mut secret_shares = Vec::new();
+        let mut transcript = Transcript::new(b"dkg output");
+        let mut identified = false;
 
-    impl PrivateMessage {
-        /// Creates a new private message.
-        pub fn new(
-            secret_share: SecretShare,
-            deckey: Scalar,
-            enckey: RistrettoPoint,
-            context: &[u8],
-        ) -> DKGResult<PrivateMessage> {
-            let encrypted_secret_share = secret_share.encrypt(&deckey, &enckey, context)?;
-
-            Ok(PrivateMessage { encrypted_secret_share })
-        }
-    }
-
-    /// The messages to be sent by the participant in round 2.
-    #[derive(Debug, Clone, Getters)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct Messages {
-        // The identifier is the intended recipient of the private message.
-        private_messages: BTreeMap<Identifier, PrivateMessage>,
-        public_message: PublicMessage,
-    }
-
-    fn validate_messages(
-        parameters: &Parameters,
-        round1_public_messages: &BTreeSet<round1::PublicMessage>,
-    ) -> DKGResult<()> {
-        if round1_public_messages.len() != *parameters.participants() as usize - 1 {
-            return Err(DKGError::IncorrectNumberOfRound1PublicMessages {
-                expected: *parameters.participants() as usize - 1,
-                actual: round1_public_messages.len(),
-            });
+        if messages.len() < 2 {
+            return Err(DKGError::InvalidNumberOfMessages);
         }
 
-        for round1_public_message in round1_public_messages {
-            if round1_public_message
-                .secret_polynomial_commitment
-                .coefficients_commitments
-                .len()
-                != *parameters.threshold() as usize
-            {
-                return Err(DKGError::InvalidSecretPolynomialCommitment {
-                    expected: *parameters.threshold() as usize,
-                    actual: round1_public_message
-                        .secret_polynomial_commitment
-                        .coefficients_commitments
-                        .len(),
-                });
+        let first_params = &messages[0].content.parameters;
+        let recipients_hash = &messages[0].content.recipients_hash;
+
+        for message in messages {
+            if &message.content.parameters != first_params {
+                return Err(DKGError::DifferentParameters);
+            }
+            if &message.content.recipients_hash != recipients_hash {
+                return Err(DKGError::DifferentRecipientsHash);
             }
         }
 
-        Ok(())
-    }
+        messages[0].content.parameters.validate()?;
 
-    /// Runs the round 2 of a SimplPedPoP protocol.
-    pub fn run<T: SigningTranscript + Clone>(
-        round1_private_data: round1::PrivateData,
-        round1_public_data: &round1::PublicData,
-        round1_public_messages: BTreeSet<round1::PublicMessage>,
-        transcript: T,
-    ) -> DKGResult<(PublicData, Messages)> {
-        round1_public_data.parameters.validate()?;
-
-        validate_messages(&round1_public_data.parameters, &round1_public_messages)?;
-
-        let public_keys = verify_round1_messages(&round1_public_messages)?;
-
-        let public_data = generate_public_data(
-            round1_public_messages,
-            round1_public_data,
-            transcript,
-            public_keys,
-        );
-
-        let secret_commitment = round1_public_data
-            .secret_polynomial_commitment
-            .coefficients_commitments
-            .first()
-            .expect("This never fails because the minimum threshold of the protocol is 2");
-
-        let messages = generate_messages(
-            &public_data,
-            &round1_private_data.secret_polynomial,
-            round1_private_data.secret_key,
-            secret_commitment,
-        )?;
-
-        Ok((public_data, messages))
-    }
-
-    fn generate_public_data<T: SigningTranscript + Clone>(
-        round1_public_messages: BTreeSet<round1::PublicMessage>,
-        round1_public_data: &round1::PublicData,
-        mut transcript: T,
-        public_keys: Vec<PublicKey>,
-    ) -> PublicData {
-        let mut own_inserted = false;
-
-        let own_first_coefficient_compressed = round1_public_data
-            .secret_polynomial_commitment
-            .coefficients_commitments
-            .first()
-            .expect("This never fails because the minimum threshold of the protocol is 2")
-            .compress();
-
-        // Writes the data of all the participants in the transcript ordered by their identifiers
-        for message in &round1_public_messages {
-            let message_first_coefficient_compressed = message
-                .secret_polynomial_commitment
-                .coefficients_commitments
-                .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2")
-                .compress();
-
-            if own_first_coefficient_compressed.0 < message_first_coefficient_compressed.0
-                && !own_inserted
-            {
-                // Writes own data in the transcript
-                transcript.commit_point(b"SecretCommitment", &own_first_coefficient_compressed);
-
-                for coefficient_commitment in
-                    &round1_public_data.secret_polynomial_commitment.coefficients_commitments
-                {
-                    transcript
-                        .commit_point(b"CoefficientCommitment", &coefficient_commitment.compress());
-                }
-
-                transcript
-                    .commit_point(b"ProofOfPossessionR", &round1_public_data.proof_of_possession.R);
-
-                own_inserted = true;
-            }
-            // Writes the data of the other participants in the transcript
-            transcript.commit_point(b"SecretCommitment", &message_first_coefficient_compressed);
-
-            for coefficient_commitment in
-                &message.secret_polynomial_commitment.coefficients_commitments
-            {
-                transcript
-                    .commit_point(b"CoefficientCommitment", &coefficient_commitment.compress());
-            }
-
-            transcript.commit_point(b"ProofOfPossessionR", &message.proof_of_possession.R);
+        let participants = messages[0].content.parameters.participants as usize;
+        if messages.len() != participants {
+            return Err(DKGError::IncorrectNumberOfMessages);
         }
 
-        // Writes own data in the transcript if own identifier is the last one
-        if !own_inserted {
-            transcript.commit_point(b"SecretCommitment", &own_first_coefficient_compressed);
-
-            for coefficient_commitment in
-                &round1_public_data.secret_polynomial_commitment.coefficients_commitments
-            {
-                transcript
-                    .commit_point(b"CoefficientCommitment", &coefficient_commitment.compress());
-            }
-
-            transcript
-                .commit_point(b"ProofOfPossessionR", &round1_public_data.proof_of_possession.R);
+        let mut verifying_keys = Vec::new();
+        for _ in 0..participants {
+            verifying_keys.push(RistrettoPoint::identity());
         }
 
-        // Scalar generated from transcript used to generate random identifiers to the participants
-        let scalar = transcript.challenge_scalar(b"participants");
+        for message in messages {
+            // Recreate the encryption environment
+            let mut enc = merlin::Transcript::new(b"Encryption");
+            message.content.parameters.commit(&mut enc);
+            enc.commit_point(b"contributor", message.content.sender.as_compressed());
 
-        let (identifiers, round1_public_messages) =
-            generate_identifiers(round1_public_data, round1_public_messages, &scalar);
+            let point_polynomial = &message.content.point_polynomial;
+            let sender = message.content.sender;
+            let ciphertexts = &message.content.ciphertexts;
 
-        PublicData { identifiers, round1_public_messages, transcript: scalar, public_keys }
-    }
+            if point_polynomial.len() != participants - 1 {
+                return Err(DKGError::IncorrectNumberOfCommitments);
+            }
 
-    fn generate_identifiers(
-        round1_public_data: &round1::PublicData,
-        round1_public_messages_set: BTreeSet<round1::PublicMessage>,
-        scalar: &Scalar,
-    ) -> (Identifiers, BTreeMap<Identifier, round1::PublicMessage>) {
-        let mut others_identifiers: BTreeSet<Identifier> = BTreeSet::new();
-        let mut round1_public_messages: BTreeMap<Identifier, round1::PublicMessage> =
-            BTreeMap::new();
+            if ciphertexts.len() != participants {
+                return Err(DKGError::IncorrectNumberOfEncryptedShares);
+            }
 
-        let mut secret_commitments: BTreeSet<[u8; 32]> = round1_public_messages_set
-            .iter()
-            .map(|msg| {
-                msg.secret_polynomial_commitment
-                    .coefficients_commitments
+            let encryption_nonce = message.content.encryption_nonce;
+            enc.append_message(b"nonce", &encryption_nonce);
+
+            let mut m = Transcript::new(b"signature");
+            m.append_message(b"message", &message.content.to_bytes());
+
+            let pk = PublicKey::from_point(
+                *message
+                    .content
+                    .point_polynomial
                     .first()
-                    .expect("This never fails because the minimum threshold of the protocol is 2")
-                    .compress()
-                    .0
-            })
-            .collect();
-
-        let own_secret_commitment = round1_public_data
-            .secret_polynomial_commitment
-            .coefficients_commitments
-            .first()
-            .expect("This never fails because the minimum threshold of the protocol is 2");
-
-        secret_commitments.insert(own_secret_commitment.compress().0);
-
-        let mut index = 0;
-        for message in &secret_commitments {
-            if message == &own_secret_commitment.compress().0 {
-                break;
-            }
-            index += 1;
-        }
-
-        for i in 0..secret_commitments.len() {
-            let input = Sha512::new().chain(scalar.as_bytes()).chain(i.to_string());
-            let random_scalar = Scalar::from_hash(input);
-            others_identifiers.insert(Identifier(random_scalar));
-        }
-
-        let own_identifier = *others_identifiers
-            .iter()
-            .nth(index)
-            .expect("This never fails because the index < len");
-        others_identifiers.remove(&own_identifier);
-
-        for (id, message) in others_identifiers.iter().zip(round1_public_messages_set) {
-            round1_public_messages.insert(*id, message);
-        }
-
-        let identifiers = Identifiers::new(own_identifier, others_identifiers);
-
-        (identifiers, round1_public_messages)
-    }
-
-    fn verify_round1_messages(
-        round1_public_messages: &BTreeSet<round1::PublicMessage>,
-    ) -> DKGResult<Vec<PublicKey>> {
-        let len = round1_public_messages.len();
-        let mut public_keys = Vec::with_capacity(len);
-        let mut proofs_of_possession = Vec::with_capacity(len);
-
-        // The public keys are the secret commitments of the participants
-        for round1_public_message in round1_public_messages {
-            let public_key = PublicKey::from_point(
-                *round1_public_message
-                    .secret_polynomial_commitment
-                    .coefficients_commitments
-                    .first()
-                    .expect("This never fails because the minimum threshold of the protocol is 2"),
+                    .expect("This never fails because the minimum threshold is 2"),
             );
-            public_keys.push(public_key);
-            proofs_of_possession.push(round1_public_message.proof_of_possession);
-        }
 
-        verify_batch(
-            vec![Transcript::new(b"Proof of Possession"); len],
-            &proofs_of_possession[..],
-            &public_keys[..],
-            false,
-        )
-        .map_err(DKGError::InvalidProofOfPossession)?;
+            // TODO: Verify batch
+            pk.verify(m.clone(), &message.proof_of_possession)
+                .map_err(DKGError::InvalidProofOfPossession)?;
 
-        Ok(public_keys)
-    }
+            sender.verify(m, &message.signature).map_err(DKGError::InvalidSignature)?;
 
-    fn generate_messages(
-        round2_public_data: &PublicData,
-        secret_polynomial: &SecretPolynomial,
-        secret_key: SecretKey,
-        secret_commitment: &SecretCommitment,
-    ) -> DKGResult<Messages> {
-        let mut private_messages = BTreeMap::new();
+            for (i, ciphertext) in ciphertexts.iter().enumerate() {
+                let original_scalar = self.decrypt_secret_share(
+                    enc.clone(),
+                    &sender,
+                    ciphertext,
+                    &encryption_nonce,
+                    i as usize,
+                );
 
-        let enc_keys: Vec<RistrettoPoint> = round2_public_data
-            .round1_public_messages
-            .values()
-            .map(|msg| {
-                *msg.secret_polynomial_commitment
-                    .coefficients_commitments
-                    .first()
-                    .expect("This never fails because the minimum threshold of the protocol is 2")
-            })
-            .collect();
+                let evaluation = evaluate_secret_share(
+                    Identifier::generate(&recipients_hash, i as u16).0,
+                    &point_polynomial,
+                );
 
-        for (i, identifier) in round2_public_data.identifiers.others_identifiers.iter().enumerate()
-        {
-            let secret_share = secret_polynomial.evaluate(&identifier.0);
-            private_messages.insert(
-                *identifier,
-                PrivateMessage::new(
-                    SecretShare(secret_share),
-                    secret_key.key,
-                    enc_keys[i],
-                    identifier.0.as_bytes(),
-                )?,
-            );
-        }
+                verifying_keys[i] += evaluation;
 
-        let public_key = PublicKey::from_point(*secret_commitment);
-
-        let mut transcript = Transcript::new(b"certificate");
-        transcript.append_message(b"scalar", round2_public_data.transcript.as_bytes());
-
-        let certificate = secret_key.sign(transcript, &public_key);
-
-        let public_message = PublicMessage { certificate };
-
-        Ok(Messages { private_messages, public_message })
-    }
-}
-
-/// SimplPedPoP round 3.
-///
-/// The participant decrypts and verifies the secret shares received from the other participants from round 2, computes
-/// its own secret share and its own total secret share, which corresponds to its share of the group public key.
-///
-/// It verifies the certificates from all the other participants and generates the shared public
-/// key and the total secret shares commitments of the other partipants.
-pub mod round3 {
-    use super::{
-        round1, round2, Certificate, Identifier, Identifiers, Parameters, SecretPolynomial,
-        SecretShare, TotalSecretShare, GENERATOR,
-    };
-    use crate::{
-        context::SigningTranscript,
-        olaf::{
-            errors::{DKGError, DKGResult},
-            keys::{GroupPublicKey, GroupPublicKeyShare},
-            polynomial::PolynomialCommitment,
-        },
-        verify_batch,
-    };
-    use alloc::{collections::BTreeMap, vec, vec::Vec};
-    use curve25519_dalek::Scalar;
-    use derive_getters::Getters;
-    use merlin::Transcript;
-    use zeroize::ZeroizeOnDrop;
-
-    /// The private data of round 3.
-    #[derive(Debug, Clone, ZeroizeOnDrop, Getters)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-    pub struct PrivateData {
-        pub(crate) total_secret_share: TotalSecretShare,
-    }
-
-    fn validate_messages(
-        parameters: &Parameters,
-        round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
-        round1_public_messages: &BTreeMap<Identifier, round1::PublicMessage>,
-        round2_private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
-    ) -> DKGResult<()> {
-        if round2_public_messages.len() != *parameters.participants() as usize - 1 {
-            return Err(DKGError::IncorrectNumberOfRound2PublicMessages {
-                expected: *parameters.participants() as usize - 1,
-                actual: round2_public_messages.len(),
-            });
-        }
-
-        if round1_public_messages.len() != *parameters.participants() as usize - 1 {
-            return Err(DKGError::IncorrectNumberOfRound1PublicMessages {
-                expected: *parameters.participants() as usize - 1,
-                actual: round1_public_messages.len(),
-            });
-        }
-
-        if round2_private_messages.len() != *parameters.participants() as usize - 1 {
-            return Err(DKGError::IncorrectNumberOfRound2PrivateMessages {
-                expected: *parameters.participants() as usize - 1,
-                actual: round2_private_messages.len(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Runs the round 3 of the SimplPedPoP protocol.
-    pub fn run(
-        round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
-        round2_public_data: &round2::PublicData,
-        round1_public_data: &round1::PublicData,
-        round1_private_data: round1::PrivateData,
-        round2_private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
-    ) -> DKGResult<(GroupPublicKey, BTreeMap<Identifier, GroupPublicKeyShare>, PrivateData)> {
-        round1_public_data.parameters.validate()?;
-
-        round2_public_data
-            .identifiers
-            .validate(round1_public_data.parameters.participants)?;
-
-        validate_messages(
-            &round1_public_data.parameters,
-            round2_public_messages,
-            &round2_public_data.round1_public_messages,
-            round2_private_messages,
-        )?;
-
-        let mut transcript = Transcript::new(b"certificate");
-        transcript.append_message(b"scalar", round2_public_data.transcript.as_bytes());
-
-        verify_round2_public_messages(round2_public_messages, round2_public_data, transcript)?;
-
-        let secret_shares = verify_round2_private_messages(
-            round2_public_data,
-            round2_private_messages,
-            &round1_private_data.secret_key.key,
-        )?;
-
-        let private_data = generate_private_data(
-            &round2_public_data.identifiers,
-            &secret_shares,
-            &round1_private_data.secret_polynomial,
-        )?;
-
-        let (group_public_key, group_public_key_shares) =
-            generate_public_data(round2_public_data, round1_public_data, &private_data)?;
-
-        Ok((group_public_key, group_public_key_shares, private_data))
-    }
-
-    fn verify_round2_public_messages<T: SigningTranscript + Clone>(
-        round2_public_messages: &BTreeMap<Identifier, round2::PublicMessage>,
-        round2_public_data: &round2::PublicData,
-        transcript: T,
-    ) -> DKGResult<()> {
-        verify_batch(
-            vec![transcript.clone(); round2_public_data.identifiers.others_identifiers.len()],
-            &round2_public_messages
-                .iter()
-                .map(|(id, msg)| {
-                    if !round2_public_data.identifiers.others_identifiers().contains(id) {
-                        Err(DKGError::UnknownIdentifierRound2PublicMessages(*id))
-                    } else {
-                        Ok(msg.certificate)
+                if evaluation == original_scalar * RISTRETTO_BASEPOINT_POINT {
+                    if !identified {
+                        // This is to distinguish different output messages in the case that recipients != participants
+                        transcript.append_u64(b"id", i as u64);
+                        identified = true;
                     }
-                })
-                .collect::<Result<Vec<Certificate>, DKGError>>()?,
-            &round2_public_data.public_keys[..],
-            false,
-        )
-        .map_err(DKGError::InvalidCertificate)
-    }
-
-    fn verify_round2_private_messages(
-        round2_public_data: &round2::PublicData,
-        round2_private_messages: &BTreeMap<Identifier, round2::PrivateMessage>,
-        secret: &Scalar,
-    ) -> DKGResult<BTreeMap<Identifier, SecretShare>> {
-        let mut secret_shares = BTreeMap::new();
-
-        for (i, (identifier, private_message)) in round2_private_messages.iter().enumerate() {
-            let secret_share = private_message.encrypted_secret_share.decrypt(
-                secret,
-                &round2_public_data.public_keys[i].into_point(),
-                round2_public_data.identifiers.own_identifier.0.as_bytes(),
-            )?;
-
-            let expected_evaluation = GENERATOR * secret_share.0;
-
-            secret_shares.insert(*identifier, secret_share);
-
-            let evaluation = round2_public_data
-                .round1_public_messages
-                .get(identifier)
-                .ok_or(DKGError::UnknownIdentifierRound1PublicMessages(*identifier))?
-                .secret_polynomial_commitment
-                .evaluate(&round2_public_data.identifiers.own_identifier.0);
-
-            if !(evaluation == expected_evaluation) {
-                return Err(DKGError::InvalidSecretShare(*identifier));
+                    secret_shares.push(original_scalar);
+                }
             }
         }
 
-        Ok(secret_shares)
-    }
+        for verifying_key in &verifying_keys {
+            if verifying_key == &RistrettoPoint::identity() {
+                return Err(DKGError::InvalidVerifyingKey);
+            }
+        }
 
-    fn generate_private_data(
-        identifiers: &Identifiers,
-        secret_shares: &BTreeMap<Identifier, SecretShare>,
-        secret_polynomial: &SecretPolynomial,
-    ) -> DKGResult<PrivateData> {
-        let own_secret_share = secret_polynomial.evaluate(&identifiers.own_identifier.0);
+        if secret_shares.len() != messages[0].content.parameters.participants as usize {
+            return Err(DKGError::IncorrectNumberOfValidSecretShares {
+                expected: messages[0].content.parameters.participants as usize,
+                actual: secret_shares.len(),
+            });
+        }
 
         let mut total_secret_share = Scalar::ZERO;
 
-        for id in &identifiers.others_identifiers {
-            total_secret_share +=
-                secret_shares.get(id).ok_or(DKGError::UnknownIdentifierRound2PrivateMessages)?.0;
+        for secret_share in secret_shares {
+            total_secret_share += secret_share;
         }
 
-        total_secret_share += own_secret_share;
+        let mut group_point = RistrettoPoint::identity();
 
-        let private_data = PrivateData { total_secret_share: SecretShare(total_secret_share) };
+        for message in messages {
+            group_point += message
+                .content
+                .point_polynomial
+                .first()
+                .expect("This never fails because the minimum threshold is 2");
+        }
 
-        Ok(private_data)
+        let dkg_output_content =
+            DKGOutputContent::new(PublicKey::from_point(group_point), verifying_keys.to_vec());
+
+        let signature = self.sign(transcript);
+
+        let dkg_output = DKGOutput::new(self.public, dkg_output_content, signature);
+
+        Ok((dkg_output, total_secret_share))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curve25519_dalek::ristretto::RistrettoPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_serialize_deserialize() {
+        let sender = Keypair::generate();
+        let encryption_nonce = [1u8; 16];
+        let parameters = Parameters { participants: 2, threshold: 1 };
+        let recipients_hash = [2u8; 16];
+        let point_polynomial =
+            vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
+        let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
+        let proof_of_possession = sender.sign(Transcript::new(b"pop"));
+        let signature = sender.sign(Transcript::new(b"sig"));
+
+        let message_content = MessageContent::new(
+            sender.public,
+            encryption_nonce,
+            parameters,
+            recipients_hash,
+            point_polynomial,
+            ciphertexts,
+        );
+
+        let message = AllMessage::new(message_content, proof_of_possession, signature);
+
+        // Serialize the message
+        let bytes = message.to_bytes();
+
+        // Deserialize the message
+        let deserialized_message = AllMessage::from_bytes(&bytes).expect("Failed to deserialize");
+
+        // Assertions to ensure that the deserialized message matches the original message
+        assert_eq!(
+            message.content.sender.to_bytes(),
+            deserialized_message.content.sender.to_bytes()
+        );
+        assert_eq!(message.content.encryption_nonce, deserialized_message.content.encryption_nonce);
+        assert_eq!(
+            message.content.parameters.participants,
+            deserialized_message.content.parameters.participants
+        );
+        assert_eq!(
+            message.content.parameters.threshold,
+            deserialized_message.content.parameters.threshold
+        );
+        assert_eq!(message.content.recipients_hash, deserialized_message.content.recipients_hash);
+        assert_eq!(
+            message.content.point_polynomial.len(),
+            deserialized_message.content.point_polynomial.len()
+        );
+        assert!(message
+            .content
+            .point_polynomial
+            .iter()
+            .zip(deserialized_message.content.point_polynomial.iter())
+            .all(|(a, b)| a.compress() == b.compress()));
+        assert_eq!(
+            message.content.ciphertexts.len(),
+            deserialized_message.content.ciphertexts.len()
+        );
+        assert!(message
+            .content
+            .ciphertexts
+            .iter()
+            .zip(deserialized_message.content.ciphertexts.iter())
+            .all(|(a, b)| a == b));
+        assert_eq!(message.proof_of_possession.R, deserialized_message.proof_of_possession.R);
+        assert_eq!(message.proof_of_possession.s, deserialized_message.proof_of_possession.s);
+        assert_eq!(message.signature.R, deserialized_message.signature.R);
+        assert_eq!(message.signature.s, deserialized_message.signature.s);
     }
 
-    fn generate_public_data(
-        round2_public_data: &round2::PublicData,
-        round1_public_data: &round1::PublicData,
-        round2_private_data: &PrivateData,
-    ) -> DKGResult<(GroupPublicKey, BTreeMap<Identifier, GroupPublicKeyShare>)> {
-        // Sum of the secret polynomial commitments of the other participants
-        let others_secret_polynomial_commitment = PolynomialCommitment::sum_polynomial_commitments(
-            &round2_public_data
-                .round1_public_messages
-                .values()
-                .map(|msg| &msg.secret_polynomial_commitment)
-                .collect::<Vec<&PolynomialCommitment>>(),
-        );
+    #[test]
+    fn test_simplpedpop_protocol() {
+        // Create participants
+        let threshold = 2;
+        let participants = 2;
+        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
+        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
 
-        // The total secret polynomial commitment, which includes the secret polynomial commitment of the participant
-        let total_secret_polynomial_commitment =
-            PolynomialCommitment::sum_polynomial_commitments(&[
-                &others_secret_polynomial_commitment,
-                &round1_public_data.secret_polynomial_commitment,
-            ]);
-
-        // The group public key shares of all the participants, which correspond to the total secret shares commitments
-        let mut group_public_key_shares = BTreeMap::new();
-
-        for identifier in &round2_public_data.identifiers.others_identifiers {
-            let group_public_key_share = total_secret_polynomial_commitment.evaluate(&identifier.0);
-
-            group_public_key_shares.insert(*identifier, group_public_key_share);
+        // Each participant creates an AllMessage
+        let mut all_messages = Vec::new();
+        for i in 0..participants {
+            let message: AllMessage =
+                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
+            all_messages.push(message);
         }
 
-        let own_group_public_key_share = round2_private_data.total_secret_share.0 * GENERATOR;
+        let mut dkg_outputs = Vec::new();
 
-        group_public_key_shares
-            .insert(round2_public_data.identifiers.own_identifier, own_group_public_key_share);
+        for kp in keypairs.iter() {
+            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
+            dkg_outputs.push(dkg_output);
+        }
 
-        let shared_public_key = GroupPublicKey::from_point(
-            *total_secret_polynomial_commitment
-                .coefficients_commitments
-                .first()
-                .expect("This never fails because the minimum threshold of the protocol is 2"),
+        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
+        assert!(
+            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
+                == w[1].0.content.group_public_key
+                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
+                && w[0]
+                    .0
+                    .content
+                    .verifying_keys
+                    .iter()
+                    .zip(w[1].0.content.verifying_keys.iter())
+                    .all(|(a, b)| a == b)),
+            "All DKG outputs should have identical group public keys and verifying keys."
         );
 
-        Ok((shared_public_key, group_public_key_shares))
+        // Verify that all verifying_keys are valid
+        for i in 0..participants {
+            for j in 0..participants {
+                assert_eq!(
+                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
+                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
+                    "Verification of total secret shares failed!"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_scalar() {
+        // Create a sender and a recipient Keypair
+        let sender = Keypair::generate();
+        let recipient = Keypair::generate();
+
+        // Generate a scalar to encrypt
+        let original_scalar = Scalar::random(&mut OsRng);
+
+        let nonce = [0; 16];
+
+        // Encrypt the scalar using sender's keypair and recipient's public key
+        let encrypted_scalar = sender.encrypt_secret_share(
+            Transcript::new(b"enc"),
+            &recipient.public,
+            &original_scalar,
+            &nonce,
+            0,
+        );
+
+        // Decrypt the scalar using recipient's keypair
+        let decrypted_scalar = recipient.decrypt_secret_share(
+            Transcript::new(b"enc"),
+            &sender.public,
+            &encrypted_scalar,
+            &nonce,
+            0,
+        );
+
+        // Check that the decrypted scalar matches the original scalar
+        assert_eq!(
+            decrypted_scalar, original_scalar,
+            "Decrypted scalar should match the original scalar."
+        );
+    }
+
+    #[test]
+    fn test_dkg_output_serialization() {
+        let mut rng = OsRng;
+        let group_public_key = RistrettoPoint::random(&mut rng);
+        let verifying_keys = vec![
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+        ];
+
+        let dkg_output_content = DKGOutputContent {
+            group_public_key: PublicKey::from_point(group_public_key),
+            verifying_keys,
+        };
+
+        let keypair = Keypair::generate();
+        let signature = keypair.sign(Transcript::new(b"test"));
+
+        let dkg_output =
+            DKGOutput { sender: keypair.public, content: dkg_output_content, signature };
+
+        // Serialize the DKGOutput
+        let bytes = dkg_output.to_bytes();
+
+        // Deserialize the DKGOutput
+        let deserialized_dkg_output =
+            DKGOutput::from_bytes(&bytes).expect("Deserialization failed");
+
+        // Check if the deserialized content matches the original
+        assert_eq!(
+            deserialized_dkg_output.content.group_public_key.as_compressed(),
+            dkg_output.content.group_public_key.as_compressed(),
+            "Group public keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.content.verifying_keys.len(),
+            dkg_output.content.verifying_keys.len(),
+            "Verifying keys counts do not match"
+        );
+
+        assert!(
+            deserialized_dkg_output
+                .content
+                .verifying_keys
+                .iter()
+                .zip(dkg_output.content.verifying_keys.iter())
+                .all(|(a, b)| a == b),
+            "Verifying keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.signature.s, dkg_output.signature.s,
+            "Signatures do not match"
+        );
     }
 }

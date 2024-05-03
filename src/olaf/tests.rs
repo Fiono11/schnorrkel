@@ -1,942 +1,226 @@
 #[cfg(test)]
 mod tests {
-    use crate::olaf::{
-        errors::DKGResult,
-        identifier::Identifier,
-        keys::{GroupPublicKey, GroupPublicKeyShare},
-        simplpedpop::{
-            self,
-            round1::{self, PrivateData, PublicData, PublicMessage},
-            round2::{self, Messages},
-            round3, Identifiers, Parameters,
-        },
+    use crate::olaf::data_structures::{
+        AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters,
     };
-    use alloc::{
-        collections::{BTreeMap, BTreeSet},
-        vec::Vec,
-    };
+    use crate::{Keypair, PublicKey};
+    use alloc::vec::Vec;
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+    use curve25519_dalek::ristretto::RistrettoPoint;
+    use curve25519_dalek::scalar::Scalar;
     use merlin::Transcript;
-    use rand::{rngs::OsRng, Rng};
+    use rand::rngs::OsRng;
 
-    const MAXIMUM_PARTICIPANTS: u16 = 10;
-    const MINIMUM_PARTICIPANTS: u16 = 3;
-    const MININUM_THRESHOLD: u16 = 2;
-    const PROTOCOL_RUNS: usize = 1;
+    #[test]
+    fn test_serialize_deserialize() {
+        let sender = Keypair::generate();
+        let encryption_nonce = [1u8; 16];
+        let parameters = Parameters { participants: 2, threshold: 1 };
+        let recipients_hash = [2u8; 16];
+        let point_polynomial =
+            vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
+        let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
+        let proof_of_possession = sender.sign(Transcript::new(b"pop"));
+        let signature = sender.sign(Transcript::new(b"sig"));
 
-    fn generate_parameters() -> Vec<Parameters> {
-        let mut rng = rand::thread_rng();
-        let max_signers = rng.gen_range(MINIMUM_PARTICIPANTS..=MAXIMUM_PARTICIPANTS);
-        let min_signers = rng.gen_range(MININUM_THRESHOLD..=max_signers);
+        let message_content = MessageContent::new(
+            sender.public,
+            encryption_nonce,
+            parameters,
+            recipients_hash,
+            point_polynomial,
+            ciphertexts,
+        );
 
-        (1..=max_signers).map(|_| Parameters::new(max_signers, min_signers)).collect()
+        let message = AllMessage::new(message_content, proof_of_possession, signature);
+
+        // Serialize the message
+        let bytes = message.to_bytes();
+
+        // Deserialize the message
+        let deserialized_message = AllMessage::from_bytes(&bytes).expect("Failed to deserialize");
+
+        // Assertions to ensure that the deserialized message matches the original message
+        assert_eq!(
+            message.content.sender.to_bytes(),
+            deserialized_message.content.sender.to_bytes()
+        );
+        assert_eq!(message.content.encryption_nonce, deserialized_message.content.encryption_nonce);
+        assert_eq!(
+            message.content.parameters.participants,
+            deserialized_message.content.parameters.participants
+        );
+        assert_eq!(
+            message.content.parameters.threshold,
+            deserialized_message.content.parameters.threshold
+        );
+        assert_eq!(message.content.recipients_hash, deserialized_message.content.recipients_hash);
+        assert_eq!(
+            message.content.point_polynomial.len(),
+            deserialized_message.content.point_polynomial.len()
+        );
+        assert!(message
+            .content
+            .point_polynomial
+            .iter()
+            .zip(deserialized_message.content.point_polynomial.iter())
+            .all(|(a, b)| a.compress() == b.compress()));
+        assert_eq!(
+            message.content.ciphertexts.len(),
+            deserialized_message.content.ciphertexts.len()
+        );
+        assert!(message
+            .content
+            .ciphertexts
+            .iter()
+            .zip(deserialized_message.content.ciphertexts.iter())
+            .all(|(a, b)| a == b));
+        assert_eq!(message.proof_of_possession.R, deserialized_message.proof_of_possession.R);
+        assert_eq!(message.proof_of_possession.s, deserialized_message.proof_of_possession.s);
+        assert_eq!(message.signature.R, deserialized_message.signature.R);
+        assert_eq!(message.signature.s, deserialized_message.signature.s);
     }
 
-    fn round1() -> (Vec<Parameters>, Vec<PrivateData>, Vec<PublicData>, Vec<BTreeSet<PublicMessage>>)
-    {
-        let parameters_list = generate_parameters();
+    #[test]
+    fn test_simplpedpop_protocol() {
+        // Create participants
+        let threshold = 2;
+        let participants = 2;
+        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
+        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
 
-        let mut all_public_messages_vec = Vec::new();
-        let mut participants_round1_private_data = Vec::new();
-        let mut participants_round1_public_data = Vec::new();
-
-        for i in 0..parameters_list.len() {
-            let (private_data, public_message, public_data) =
-                round1::run(parameters_list[i as usize].clone(), OsRng)
-                    .expect("Round 1 should complete without errors!");
-
-            all_public_messages_vec.push(public_message.clone());
-            participants_round1_public_data.push(public_data);
-            participants_round1_private_data.push(private_data);
+        // Each participant creates an AllMessage
+        let mut all_messages = Vec::new();
+        for i in 0..participants {
+            let message: AllMessage =
+                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
+            all_messages.push(message);
         }
 
-        let mut received_round1_public_messages: Vec<BTreeSet<PublicMessage>> = Vec::new();
+        let mut dkg_outputs = Vec::new();
 
-        let mut all_public_messages = BTreeSet::new();
-
-        for i in 0..parameters_list[0].participants {
-            all_public_messages.insert(all_public_messages_vec[i as usize].clone());
+        for kp in keypairs.iter() {
+            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
+            dkg_outputs.push(dkg_output);
         }
 
-        // Iterate through each participant to create a set of messages excluding their own.
-        for i in 0..parameters_list[0].participants {
-            let own_message = PublicMessage::new(&participants_round1_public_data[i as usize]);
+        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
+        assert!(
+            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
+                == w[1].0.content.group_public_key
+                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
+                && w[0]
+                    .0
+                    .content
+                    .verifying_keys
+                    .iter()
+                    .zip(w[1].0.content.verifying_keys.iter())
+                    .all(|(a, b)| a == b)),
+            "All DKG outputs should have identical group public keys and verifying keys."
+        );
 
-            let mut messages_for_participant = BTreeSet::new();
-
-            for message in &all_public_messages {
-                if &own_message != message {
-                    // Exclude the participant's own message.
-                    messages_for_participant.insert(message.clone());
-                }
-            }
-
-            received_round1_public_messages.push(messages_for_participant);
-        }
-
-        (
-            parameters_list,
-            participants_round1_private_data,
-            participants_round1_public_data,
-            received_round1_public_messages,
-        )
-    }
-
-    fn round2(
-        parameters_list: &Vec<Parameters>,
-        participants_round1_private_data: Vec<PrivateData>,
-        participants_round1_public_data: &Vec<PublicData>,
-        participants_round1_public_messages: &Vec<BTreeSet<PublicMessage>>,
-    ) -> DKGResult<(Vec<round2::PublicData>, Vec<Messages>, Vec<Identifiers>, Vec<Identifier>)>
-    {
-        let mut participants_round2_public_data = Vec::new();
-        let mut participants_round2_public_messages = Vec::new();
-        let mut participants_set_of_participants = Vec::new();
-        let mut identifiers_vec = Vec::new();
-
-        for i in 0..parameters_list[0].participants {
-            let result = simplpedpop::round2::run(
-                participants_round1_private_data[i as usize].clone(),
-                &participants_round1_public_data[i as usize].clone(),
-                participants_round1_public_messages[i as usize].clone(),
-                Transcript::new(b"simplpedpop"),
-            )?;
-
-            participants_round2_public_data.push(result.0.clone());
-            participants_round2_public_messages.push(result.1);
-            participants_set_of_participants.push(result.0.identifiers.clone());
-            identifiers_vec.push(result.0.identifiers.own_identifier);
-        }
-
-        Ok((
-            participants_round2_public_data,
-            participants_round2_public_messages,
-            participants_set_of_participants,
-            identifiers_vec,
-        ))
-    }
-
-    fn round3(
-        participants_sets_of_participants: &Vec<Identifiers>,
-        participants_round2_public_messages: &Vec<round2::PublicMessage>,
-        participants_round2_public_data: &Vec<round2::PublicData>,
-        participants_round1_public_data: &Vec<round1::PublicData>,
-        participants_round1_private_data: Vec<round1::PrivateData>,
-        participants_round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>>,
-        identifiers_vec: &Vec<Identifier>,
-    ) -> DKGResult<
-        Vec<(GroupPublicKey, BTreeMap<Identifier, GroupPublicKeyShare>, round3::PrivateData)>,
-    > {
-        let mut participant_data_round3 = Vec::new();
-
-        for i in 0..participants_sets_of_participants.len() {
-            let received_round2_public_messages = participants_round2_public_messages
-                .iter()
-                .enumerate()
-                .filter(|(index, _msg)| {
-                    identifiers_vec[*index]
-                        != participants_sets_of_participants[i as usize].own_identifier
-                })
-                .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
-                .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
-
-            let mut round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>> =
-                Vec::new();
-
-            for participants in participants_sets_of_participants.iter() {
-                let mut messages_for_participant = BTreeMap::new();
-
-                for (i, round_messages) in participants_round2_private_messages.iter().enumerate() {
-                    if let Some(message) = round_messages.get(&participants.own_identifier) {
-                        messages_for_participant.insert(identifiers_vec[i], message.clone());
-                    }
-                }
-
-                round2_private_messages.push(messages_for_participant);
-            }
-
-            let result = round3::run(
-                &received_round2_public_messages,
-                &participants_round2_public_data[i as usize],
-                &participants_round1_public_data[i as usize],
-                participants_round1_private_data[i as usize].clone(),
-                &round2_private_messages[i as usize],
-            )?;
-
-            participant_data_round3.push(result);
-        }
-
-        Ok(participant_data_round3)
-    }
-
-    mod simplpedpop_tests {
-        use super::*;
-        use crate::{
-            olaf::{
-                errors::DKGError,
-                polynomial::{Polynomial, PolynomialCommitment},
-                simplpedpop::{EncryptedSecretShare, SecretShare},
-            },
-            PublicKey, SecretKey, SignatureError,
-        };
-        use curve25519_dalek::{RistrettoPoint, Scalar};
-        use simplpedpop_tests::simplpedpop::GENERATOR;
-
-        #[test]
-        pub fn test_successful_simplpedpop() {
-            for _ in 0..PROTOCOL_RUNS {
-                let (
-                    parameters_list,
-                    participants_round1_private_data,
-                    participants_round1_public_data,
-                    participants_round1_public_messages,
-                ) = round1();
-
-                let (
-                    participants_round2_public_data,
-                    participants_round2_messages,
-                    participants_sets_of_participants,
-                    identifiers_vec,
-                ) = round2(
-                    &parameters_list,
-                    participants_round1_private_data.clone(),
-                    &participants_round1_public_data,
-                    &participants_round1_public_messages,
-                )
-                .unwrap();
-
-                let participants_data_round3 = round3(
-                    &participants_sets_of_participants,
-                    &participants_round2_messages
-                        .iter()
-                        .map(|msg| msg.public_message().clone())
-                        .collect(),
-                    &participants_round2_public_data,
-                    &participants_round1_public_data,
-                    participants_round1_private_data,
-                    participants_round2_messages
-                        .iter()
-                        .map(|msg| msg.private_messages().clone())
-                        .collect(),
-                    &identifiers_vec,
-                )
-                .unwrap();
-
-                let shared_public_keys: Vec<GroupPublicKey> =
-                    participants_data_round3.iter().map(|state| state.0).collect();
-
-                assert!(
-                    shared_public_keys.windows(2).all(|w| w[0] == w[1]),
-                    "All participants must have the same group public key!"
+        // Verify that all verifying_keys are valid
+        for i in 0..participants {
+            for j in 0..participants {
+                assert_eq!(
+                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
+                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
+                    "Verification of total secret shares failed!"
                 );
-
-                for i in 0..parameters_list[0].participants {
-                    assert_eq!(
-                        participants_data_round3[i as usize]
-                            .1
-                            .get(&participants_sets_of_participants[i as usize].own_identifier)
-                            .unwrap()
-                            .compress(),
-                        (participants_data_round3[i as usize].2.total_secret_share.0 * GENERATOR)
-                            .compress(),
-                        "Verification of total secret shares failed!"
-                    );
-                }
             }
         }
+    }
 
-        #[test]
-        fn test_incorrect_number_of_round1_public_messages_in_round2() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                mut participants_round1_public_messages,
-            ) = round1();
+    #[test]
+    fn test_encrypt_decrypt_scalar() {
+        // Create a sender and a recipient Keypair
+        let sender = Keypair::generate();
+        let recipient = Keypair::generate();
 
-            participants_round1_public_messages[0].pop_last();
+        // Generate a scalar to encrypt
+        let original_scalar = Scalar::random(&mut OsRng);
 
-            let result = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            );
+        let nonce = [0; 16];
 
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::IncorrectNumberOfRound1PublicMessages {
-                        expected: parameters_list[0].participants as usize - 1,
-                        actual: parameters_list[0].participants as usize - 2,
-                    },
-                    "Expected DKGError::IncorrectNumberOfRound1PublicMessages."
-                ),
-            }
-        }
+        // Encrypt the scalar using sender's keypair and recipient's public key
+        let encrypted_scalar = sender.encrypt_secret_share(
+            Transcript::new(b"enc"),
+            &recipient.public,
+            &original_scalar,
+            &nonce,
+            0,
+        );
 
-        #[test]
-        fn test_invalid_secret_polynomial_commitment_in_round2() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                mut participants_round1_public_messages,
-            ) = round1();
+        // Decrypt the scalar using recipient's keypair
+        let decrypted_scalar = recipient.decrypt_secret_share(
+            Transcript::new(b"enc"),
+            &sender.public,
+            &encrypted_scalar,
+            &nonce,
+            0,
+        );
 
-            let mut new_message = participants_round1_public_messages[0].first().unwrap().clone();
+        // Check that the decrypted scalar matches the original scalar
+        assert_eq!(
+            decrypted_scalar, original_scalar,
+            "Decrypted scalar should match the original scalar."
+        );
+    }
 
-            new_message.secret_polynomial_commitment.coefficients_commitments.pop();
+    #[test]
+    fn test_dkg_output_serialization() {
+        let mut rng = OsRng;
+        let group_public_key = RistrettoPoint::random(&mut rng);
+        let verifying_keys = vec![
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+            RistrettoPoint::random(&mut rng),
+        ];
 
-            participants_round1_public_messages[0].pop_first();
-            participants_round1_public_messages[0].insert(new_message);
+        let dkg_output_content = DKGOutputContent {
+            group_public_key: PublicKey::from_point(group_public_key),
+            verifying_keys,
+        };
 
-            let result = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            );
+        let keypair = Keypair::generate();
+        let signature = keypair.sign(Transcript::new(b"test"));
 
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InvalidSecretPolynomialCommitment {
-                        expected: *parameters_list[0].threshold() as usize,
-                        actual: *parameters_list[0].threshold() as usize - 1,
-                    },
-                    "Expected DKGError::IncorrectNumberOfRound1PublicMessages."
-                ),
-            }
-        }
+        let dkg_output =
+            DKGOutput { sender: keypair.public, content: dkg_output_content, signature };
 
-        #[test]
-        fn test_invalid_secret_share_error_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
+        // Serialize the DKGOutput
+        let bytes = dkg_output.to_bytes();
 
-            let (
-                participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
+        // Deserialize the DKGOutput
+        let deserialized_dkg_output =
+            DKGOutput::from_bytes(&bytes).expect("Deserialization failed");
 
-            let mut participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
+        // Check if the deserialized content matches the original
+        assert_eq!(
+            deserialized_dkg_output.content.group_public_key.as_compressed(),
+            dkg_output.content.group_public_key.as_compressed(),
+            "Group public keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.content.verifying_keys.len(),
+            dkg_output.content.verifying_keys.len(),
+            "Verifying keys counts do not match"
+        );
+
+        assert!(
+            deserialized_dkg_output
+                .content
+                .verifying_keys
                 .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let enc_keys: Vec<RistrettoPoint> = participants_round1_public_messages[1]
-                .iter()
-                .map(|msg| {
-                    *msg.secret_polynomial_commitment.coefficients_commitments.first().unwrap()
-                })
-                .collect();
-
-            let secret_share = SecretShare(Scalar::random(&mut OsRng));
-
-            let identifiers: BTreeSet<Identifier> =
-                participants_sets_of_participants[1].others_identifiers.clone();
-
-            let index = identifiers
-                .iter()
-                .position(|x| x == &participants_sets_of_participants[0].own_identifier)
-                .unwrap();
-
-            let enc_share = secret_share.encrypt(
-                &participants_round1_private_data[1].secret_key.key,
-                &enc_keys[index],
-                participants_sets_of_participants[0].own_identifier.0.as_bytes(),
-            );
-
-            let private_message = participants_round2_private_messages[1]
-                .get_mut(&participants_sets_of_participants[0].own_identifier)
-                .unwrap();
-
-            private_message.encrypted_secret_share = enc_share.unwrap();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect(),
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InvalidSecretShare(
-                        participants_sets_of_participants[1].own_identifier
-                    ),
-                    "Expected DKGError::InvalidSecretShare."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_decryption_error_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let mut participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let private_message = participants_round2_private_messages[1]
-                .get_mut(&participants_sets_of_participants[0].own_identifier)
-                .unwrap();
-
-            private_message.encrypted_secret_share = EncryptedSecretShare(vec![1]);
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect(),
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::DecryptionError(chacha20poly1305::Error),
-                    "Expected DKGError::DecryptionError."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_invalid_proof_of_possession_in_round2() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                mut participants_round1_public_messages,
-            ) = round1();
-
-            let sk = SecretKey::generate();
-            let proof_of_possession = sk.sign(
-                Transcript::new(b"invalid proof of possession"),
-                &PublicKey::from(sk.clone()),
-            );
-            let msg = PublicMessage {
-                secret_polynomial_commitment: PolynomialCommitment::commit(&Polynomial::generate(
-                    &mut OsRng,
-                    parameters_list[0].threshold - 1,
-                )),
-                proof_of_possession,
-            };
-            participants_round1_public_messages[0].pop_last();
-            participants_round1_public_messages[0].insert(msg);
-
-            let result = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InvalidProofOfPossession(SignatureError::EquationFalse),
-                    "Expected DKGError::InvalidProofOfPossession."
-                ),
-            }
-        }
-
-        #[test]
-        pub fn test_invalid_certificate_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                mut participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            participants_round2_public_data[0].transcript = Scalar::random(&mut OsRng);
-
-            let participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect(),
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InvalidCertificate(SignatureError::EquationFalse),
-                    "Expected DKGError::InvalidCertificate."
-                ),
-            }
-        }
-
-        #[test]
-        pub fn test_incorrect_number_of_round2_public_messages_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let mut participants_round2_public_messages: Vec<round2::PublicMessage> =
-                participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect();
-
-            participants_round2_public_messages.pop();
-
-            let participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_public_messages,
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::IncorrectNumberOfRound2PublicMessages {
-                        expected: *parameters_list[0].participants() as usize - 1,
-                        actual: *parameters_list[0].participants() as usize - 2
-                    },
-                    "Expected DKGError::IncorrectNumberOfRound2PublicMessages."
-                ),
-            }
-        }
-
-        #[test]
-        pub fn test_incorrect_number_of_round1_public_messages_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                mut participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let participants_round2_public_messages: Vec<round2::PublicMessage> =
-                participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect();
-
-            participants_round2_public_data[0].round1_public_messages.pop_first();
-
-            let participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_public_messages,
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::IncorrectNumberOfRound1PublicMessages {
-                        expected: *parameters_list[0].participants() as usize - 1,
-                        actual: *parameters_list[0].participants() as usize - 2
-                    },
-                    "Expected DKGError::IncorrectNumberOfRound1PublicMessages."
-                ),
-            }
-        }
-
-        #[test]
-        pub fn test_incorrect_number_of_round2_private_messages_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let participants_round2_public_messages: Vec<round2::PublicMessage> =
-                participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect();
-
-            let mut participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            participants_round2_private_messages[1].pop_last();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_public_messages,
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::IncorrectNumberOfRound2PrivateMessages {
-                        expected: *parameters_list[0].participants() as usize - 1,
-                        actual: *parameters_list[0].participants() as usize - 2
-                    },
-                    "Expected DKGError::IncorrectNumberOfRound2PrivateMessages."
-                ),
-            }
-        }
-
-        #[test]
-        pub fn test_unknown_identifier_from_round2_public_messages_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                mut identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let participants_round2_public_messages: Vec<round2::PublicMessage> =
-                participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect();
-
-            identifiers_vec.pop();
-            let unknown_identifier = Identifier(Scalar::random(&mut OsRng));
-            identifiers_vec.push(unknown_identifier);
-
-            let participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let result = round3(
-                &participants_sets_of_participants,
-                &participants_round2_public_messages,
-                &participants_round2_public_data,
-                &participants_round1_public_data,
-                participants_round1_private_data,
-                participants_round2_private_messages,
-                &identifiers_vec,
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::UnknownIdentifierRound2PublicMessages(unknown_identifier),
-                    "Expected DKGError::UnknownIdentifierRound2PublicMessages."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_unknown_identifier_from_round2_private_messages_in_round3() {
-            let (
-                parameters_list,
-                participants_round1_private_data,
-                participants_round1_public_data,
-                participants_round1_public_messages,
-            ) = round1();
-
-            let (
-                mut participants_round2_public_data,
-                participants_round2_messages,
-                participants_sets_of_participants,
-                identifiers_vec,
-            ) = round2(
-                &parameters_list,
-                participants_round1_private_data.clone(),
-                &participants_round1_public_data,
-                &participants_round1_public_messages,
-            )
-            .unwrap();
-
-            let participants_round2_public_messages: Vec<round2::PublicMessage> =
-                participants_round2_messages
-                    .iter()
-                    .map(|msg| msg.public_message().clone())
-                    .collect();
-
-            let participants_round2_private_messages: Vec<
-                BTreeMap<Identifier, round2::PrivateMessage>,
-            > = participants_round2_messages
-                .iter()
-                .map(|msg| msg.private_messages().clone())
-                .collect();
-
-            let received_round2_public_messages = participants_round2_public_messages
-                .iter()
-                .enumerate()
-                .filter(|(index, _msg)| {
-                    identifiers_vec[*index] != participants_sets_of_participants[0].own_identifier
-                })
-                .map(|(index, msg)| (identifiers_vec[index], msg.clone()))
-                .collect::<BTreeMap<Identifier, round2::PublicMessage>>();
-
-            let mut round2_private_messages: Vec<BTreeMap<Identifier, round2::PrivateMessage>> =
-                Vec::new();
-
-            for participants in participants_sets_of_participants.iter() {
-                let mut messages_for_participant = BTreeMap::new();
-
-                for (i, round_messages) in participants_round2_private_messages.iter().enumerate() {
-                    if let Some(message) = round_messages.get(&participants.own_identifier) {
-                        messages_for_participant.insert(identifiers_vec[i], message.clone());
-                    }
-                }
-
-                round2_private_messages.push(messages_for_participant);
-            }
-
-            let unknown_identifier = Identifier(Scalar::ONE);
-
-            let private_message = round2_private_messages[0].pop_first().unwrap().1;
-            round2_private_messages[0].insert(unknown_identifier, private_message);
-
-            let public_message =
-                participants_round2_public_data[0].round1_public_messages.pop_first().unwrap().1;
-
-            participants_round2_public_data[0]
-                .round1_public_messages
-                .insert(unknown_identifier, public_message);
-
-            let result = round3::run(
-                &received_round2_public_messages,
-                &participants_round2_public_data[0],
-                &participants_round1_public_data[0],
-                participants_round1_private_data[0].clone(),
-                &round2_private_messages[0],
-            );
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::UnknownIdentifierRound2PrivateMessages,
-                    "Expected DKGError::UnknownIdentifierRound2PrivateMessages."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_invalid_threshold() {
-            let parameters = Parameters::new(3, 1);
-            let result = round1::run(parameters, &mut OsRng);
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InsufficientThreshold,
-                    "Expected DKGError::InsufficientThreshold."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_invalid_participants() {
-            let parameters = Parameters::new(1, 2);
-            let result = round1::run(parameters, &mut OsRng);
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::InvalidNumberOfParticipants,
-                    "Expected DKGError::InvalidNumberOfParticipants."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_threshold_greater_than_participants() {
-            let parameters = Parameters::new(2, 3);
-            let result = round1::run(parameters, &mut OsRng);
-
-            match result {
-                Ok(_) => panic!("Expected an error, but got Ok."),
-                Err(e) => assert_eq!(
-                    e,
-                    DKGError::ExcessiveThreshold,
-                    "Expected DKGError::ExcessiveThreshold."
-                ),
-            }
-        }
-
-        #[test]
-        fn test_encryption_decryption() {
-            let mut rng = OsRng;
-            let deckey = Scalar::random(&mut rng);
-            let enckey = RistrettoPoint::random(&mut rng);
-            let context = b"context";
-
-            let original_share = SecretShare(Scalar::random(&mut rng));
-
-            let encrypted_share = original_share.encrypt(&deckey, &enckey, context);
-            let decrypted_share = encrypted_share.unwrap().decrypt(&deckey, &enckey, context);
-
-            assert_eq!(
-                original_share.0,
-                decrypted_share.unwrap().0,
-                "Decryption must return the original share!"
-            );
-        }
+                .zip(dkg_output.content.verifying_keys.iter())
+                .all(|(a, b)| a == b),
+            "Verifying keys do not match"
+        );
+
+        assert_eq!(
+            deserialized_dkg_output.signature.s, dkg_output.signature.s,
+            "Signatures do not match"
+        );
     }
 }

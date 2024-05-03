@@ -2,9 +2,7 @@
 //! Key Generation (DKG) protocol SimplPedPoP and the Threshold Signing protocol FROST.
 
 pub mod errors;
-pub mod identifier;
-//pub mod keys;
-//mod polynomial;
-//pub mod simplpedpop;
-//mod tests;
-pub mod spp;
+pub mod simplpedpop;
+mod tests;
+mod data_structures;
+mod utils;
