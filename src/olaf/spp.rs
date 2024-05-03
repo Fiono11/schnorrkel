@@ -206,6 +206,8 @@ impl Keypair {
     pub fn simplpedpop_recipient_all(&self, messages: &[AllMessage]) -> DKGResult<DKGOutput> {
         let mut secret_shares = Vec::new();
         let mut verifying_keys = Vec::new();
+        let mut transcript = Transcript::new(b"dkg output");
+        let mut identified = false;
 
         for message in messages {
             let mut verifying_key = RistrettoPoint::identity();
@@ -230,6 +232,11 @@ impl Keypair {
                 );
 
                 if evaluation == original_scalar * RISTRETTO_BASEPOINT_POINT {
+                    if !identified {
+                        // This is to distinguish different output messages in the case that recipients != participants
+                        transcript.append_u64(b"id", i as u64);
+                        identified = true;
+                    }
                     verifying_key += evaluation;
                     secret_shares.push(original_scalar);
                     break;
@@ -260,10 +267,9 @@ impl Keypair {
             verifying_keys,
         };
 
-        let mut transcript = Transcript::new(b"dkg output");
         let signature = self.sign(transcript);
 
-        let dkg_output = DKGOutput { content: dkg_output_content, signature };
+        let dkg_output = DKGOutput { sender: self.public, content: dkg_output_content, signature };
 
         Ok(dkg_output)
     }
@@ -374,6 +380,7 @@ impl MessageContent {
 }
 
 pub struct DKGOutput {
+    sender: PublicKey,
     content: DKGOutputContent,
     signature: Signature,
 }
@@ -382,6 +389,9 @@ impl DKGOutput {
     /// Serializes the DKGOutput into bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+
+        let pk_bytes = self.sender.to_bytes();
+        bytes.extend(pk_bytes);
 
         // Serialize the content
         let content_bytes = self.content.to_bytes();
@@ -397,7 +407,13 @@ impl DKGOutput {
     /// Deserializes the DKGOutput from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DKGError> {
         let mut cursor = 0;
-        let content_bytes = &bytes[..bytes.len() - 64];
+
+        // TODO: constants
+        let pk_bytes = &bytes[..32];
+        let sender = PublicKey::from_bytes(pk_bytes).map_err(DKGError::InvalidPublicKey)?;
+        cursor += 32;
+
+        let content_bytes = &bytes[cursor..bytes.len() - 64];
         let content = DKGOutputContent::from_bytes(content_bytes)?;
 
         cursor = bytes.len() - 64;
@@ -405,7 +421,7 @@ impl DKGOutput {
         let signature = Signature::from_bytes(&bytes[cursor..cursor + 64])
             .map_err(DKGError::InvalidSignature)?;
 
-        Ok(DKGOutput { content, signature })
+        Ok(DKGOutput { sender, content, signature })
     }
 }
 
@@ -756,7 +772,8 @@ mod tests {
         let keypair = Keypair::generate();
         let signature = keypair.sign(Transcript::new(b"test"));
 
-        let dkg_output = DKGOutput { content: dkg_output_content, signature };
+        let dkg_output =
+            DKGOutput { sender: keypair.public, content: dkg_output_content, signature };
 
         // Serialize the DKGOutput
         let bytes = dkg_output.to_bytes();
