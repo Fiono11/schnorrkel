@@ -96,4 +96,18 @@ pub enum DKGError {
         /// The actual value.
         actual: usize,
     },
+    /// The parameters of all messages should be equal.
+    DifferentParameters,
+    /// The recipients hash of all messages should be equal.
+    DifferentRecipientsHash,
+    /// The number of messages should be 2 at least, which the minimum number of participants.
+    InvalidNumberOfMessages,
+    /// The number of messages should be equal to the number of participants.
+    IncorrectNumberOfMessages,
+    /// The number of commitments per message should be equal to the number of participants - 1.
+    IncorrectNumberOfCommitments,
+    /// The number of encrypted shares per message should be equal to the number of participants.
+    IncorrectNumberOfEncryptedShares,
+    /// The verifying key is invalid.
+    InvalidVerifyingKey,
 }

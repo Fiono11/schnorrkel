@@ -14,7 +14,7 @@ use crate::{context::SigningTranscript, Keypair, PublicKey, SecretKey, Signature
 use super::errors::{DKGError, DKGResult};
 
 /// The parameters of a given execution of the SimplPedPoP protocol.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Parameters {
     participants: u16,
     threshold: u16,
@@ -59,21 +59,19 @@ pub fn identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
 
 impl Keypair {
     /// Encrypt a single scalar evaluation for a single recipient.
-    pub fn encrypt_secret_share(
+    pub fn encrypt_secret_share<T: SigningTranscript>(
         &self,
+        mut transcript: T,
         recipient: &PublicKey,
         scalar_evaluation: &Scalar,
         nonce: &[u8; 16],
         i: usize,
     ) -> Scalar {
-        // Initialize the transcript for encryption
-        let mut transcript = Transcript::new(b"SingleScalarEncryption");
-        // We tweak by i too since encrypton_nonce is not truly a nonce.
-        transcript.append_message(b"i", &i.to_le_bytes());
+        transcript.commit_bytes(b"i", &i.to_le_bytes());
         transcript.commit_point(b"contributor", &self.public.as_compressed());
         transcript.commit_point(b"recipient", recipient.as_compressed());
 
-        transcript.append_message(b"nonce", nonce);
+        transcript.commit_bytes(b"nonce", nonce);
 
         self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &recipient);
 
@@ -85,21 +83,20 @@ impl Keypair {
     }
 
     /// Decrypt a single scalar evaluation for a single sender.
-    pub fn decrypt_secret_share(
+    pub fn decrypt_secret_share<T: SigningTranscript>(
         &self,
+        mut transcript: T,
         sender: &PublicKey,
         encrypted_scalar: &Scalar,
         nonce: &[u8; 16],
         i: usize,
     ) -> Scalar {
-        // Initialize the transcript for decryption using the same setup as encryption
-        let mut transcript = Transcript::new(b"SingleScalarEncryption");
-        transcript.append_message(b"i", &i.to_le_bytes());
+        transcript.commit_bytes(b"i", &i.to_le_bytes());
         transcript.commit_point(b"contributor", sender.as_compressed());
         transcript.commit_point(b"recipient", &self.public.as_compressed());
 
         // Append the same nonce used during encryption
-        transcript.append_message(b"nonce", nonce);
+        transcript.commit_bytes(b"nonce", nonce);
 
         self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &sender);
 
@@ -166,6 +163,7 @@ impl Keypair {
         let mut ciphertexts = Vec::new();
         for i in 0..parameters.participants {
             let ciphertext = self.encrypt_secret_share(
+                enc0.clone(),
                 &recipients[i as usize],
                 &scalar_evaluations[i as usize],
                 &encryption_nonce,
@@ -206,29 +204,68 @@ impl Keypair {
         messages: &[AllMessage],
     ) -> DKGResult<(DKGOutput, Scalar)> {
         let mut secret_shares = Vec::new();
-        let mut verifying_keys = [RistrettoPoint::identity(); 2];
         let mut transcript = Transcript::new(b"dkg output");
         let mut identified = false;
 
-        assert!(messages.len() == 2);
+        if messages.len() < 2 {
+            return Err(DKGError::InvalidNumberOfMessages);
+        }
+
+        let first_params = &messages[0].content.parameters;
+        let recipients_hash = &messages[0].content.recipients_hash;
+
+        for message in messages {
+            if &message.content.parameters != first_params {
+                return Err(DKGError::DifferentParameters);
+            }
+            if &message.content.recipients_hash != recipients_hash {
+                return Err(DKGError::DifferentRecipientsHash);
+            }
+        }
+
+        messages[0].content.parameters.validate()?;
+
+        let participants = messages[0].content.parameters.participants as usize;
+        if messages.len() != participants {
+            return Err(DKGError::IncorrectNumberOfMessages);
+        }
+
+        let mut verifying_keys = Vec::new();
+        for _ in 0..participants {
+            verifying_keys.push(RistrettoPoint::identity());
+        }
 
         for message in messages {
             // Recreate the encryption environment
             let mut enc = merlin::Transcript::new(b"Encryption");
             message.content.parameters.commit(&mut enc);
             enc.commit_point(b"contributor", message.content.sender.as_compressed());
-            let recipients_hash = message.content.recipients_hash;
+
             let point_polynomial = &message.content.point_polynomial;
             let sender = message.content.sender;
+            let ciphertexts = &message.content.ciphertexts;
+
+            if point_polynomial.len() != participants - 1 {
+                return Err(DKGError::IncorrectNumberOfCommitments);
+            }
+
+            if ciphertexts.len() != participants {
+                return Err(DKGError::IncorrectNumberOfEncryptedShares);
+            }
 
             let encryption_nonce = message.content.encryption_nonce;
             enc.append_message(b"nonce", &encryption_nonce);
 
             assert!(message.content.ciphertexts.len() == 2);
 
-            for (i, ciphertext) in message.content.ciphertexts.iter().enumerate() {
-                let original_scalar =
-                    self.decrypt_secret_share(&sender, ciphertext, &encryption_nonce, i as usize);
+            for (i, ciphertext) in ciphertexts.iter().enumerate() {
+                let original_scalar = self.decrypt_secret_share(
+                    enc.clone(),
+                    &sender,
+                    ciphertext,
+                    &encryption_nonce,
+                    i as usize,
+                );
 
                 let evaluation = evaluate_secret_share(
                     identifier(&recipients_hash, i as u16),
@@ -249,10 +286,10 @@ impl Keypair {
         }
 
         for verifying_key in &verifying_keys {
-            assert!(*verifying_key != RistrettoPoint::identity());
+            if verifying_key == &RistrettoPoint::identity() {
+                return Err(DKGError::InvalidVerifyingKey);
+            }
         }
-
-        assert!(verifying_keys.len() == messages[0].content.parameters.participants as usize);
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
             return Err(DKGError::IncorrectNumberOfSecretShares {
@@ -714,7 +751,7 @@ mod tests {
             dkg_outputs.push(dkg_output);
         }
 
-        // Assert that all DKG outputs are equal for group_public_key and verifying_keys
+        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
         assert!(
             dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
                 == w[1].0.content.group_public_key
@@ -729,6 +766,7 @@ mod tests {
             "All DKG outputs should have identical group public keys and verifying keys."
         );
 
+        // Verify that all verifying_keys are valid
         for i in 0..participants {
             for j in 0..participants {
                 assert_eq!(
@@ -752,12 +790,22 @@ mod tests {
         let nonce = [0; 16];
 
         // Encrypt the scalar using sender's keypair and recipient's public key
-        let encrypted_scalar =
-            sender.encrypt_secret_share(&recipient.public, &original_scalar, &nonce, 0);
+        let encrypted_scalar = sender.encrypt_secret_share(
+            Transcript::new(b"enc"),
+            &recipient.public,
+            &original_scalar,
+            &nonce,
+            0,
+        );
 
         // Decrypt the scalar using recipient's keypair
-        let decrypted_scalar =
-            recipient.decrypt_secret_share(&sender.public, &encrypted_scalar, &nonce, 0);
+        let decrypted_scalar = recipient.decrypt_secret_share(
+            Transcript::new(b"enc"),
+            &sender.public,
+            &encrypted_scalar,
+            &nonce,
+            0,
+        );
 
         // Check that the decrypted scalar matches the original scalar
         assert_eq!(
