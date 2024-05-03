@@ -12,7 +12,57 @@ mod tests {
     use rand::rngs::OsRng;
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_simplpedpop_protocol() {
+        // Create participants
+        let threshold = 2;
+        let participants = 2;
+        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
+        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
+
+        // Each participant creates an AllMessage
+        let mut all_messages = Vec::new();
+        for i in 0..participants {
+            let message: AllMessage =
+                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
+            all_messages.push(message);
+        }
+
+        let mut dkg_outputs = Vec::new();
+
+        for kp in keypairs.iter() {
+            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
+            dkg_outputs.push(dkg_output);
+        }
+
+        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
+        assert!(
+            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
+                == w[1].0.content.group_public_key
+                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
+                && w[0]
+                    .0
+                    .content
+                    .verifying_keys
+                    .iter()
+                    .zip(w[1].0.content.verifying_keys.iter())
+                    .all(|(a, b)| a == b)),
+            "All DKG outputs should have identical group public keys and verifying keys."
+        );
+
+        // Verify that all verifying_keys are valid
+        for i in 0..participants {
+            for j in 0..participants {
+                assert_eq!(
+                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
+                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
+                    "Verification of total secret shares failed!"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_all_message() {
         let sender = Keypair::generate();
         let encryption_nonce = [1u8; 16];
         let parameters = Parameters { participants: 2, threshold: 1 };
@@ -82,57 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simplpedpop_protocol() {
-        // Create participants
-        let threshold = 2;
-        let participants = 2;
-        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
-        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
-
-        // Each participant creates an AllMessage
-        let mut all_messages = Vec::new();
-        for i in 0..participants {
-            let message: AllMessage =
-                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
-            all_messages.push(message);
-        }
-
-        let mut dkg_outputs = Vec::new();
-
-        for kp in keypairs.iter() {
-            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
-            dkg_outputs.push(dkg_output);
-        }
-
-        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
-        assert!(
-            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
-                == w[1].0.content.group_public_key
-                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
-                && w[0]
-                    .0
-                    .content
-                    .verifying_keys
-                    .iter()
-                    .zip(w[1].0.content.verifying_keys.iter())
-                    .all(|(a, b)| a == b)),
-            "All DKG outputs should have identical group public keys and verifying keys."
-        );
-
-        // Verify that all verifying_keys are valid
-        for i in 0..participants {
-            for j in 0..participants {
-                assert_eq!(
-                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
-                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
-                    "Verification of total secret shares failed!"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_scalar() {
+    fn test_encrypt_decrypt_secret_share() {
         // Create a sender and a recipient Keypair
         let sender = Keypair::generate();
         let recipient = Keypair::generate();

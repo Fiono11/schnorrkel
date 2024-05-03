@@ -38,19 +38,6 @@ impl Parameters {
     }
 }
 
-pub(crate) struct Identifier(pub(crate) Scalar);
-
-impl Identifier {
-    /// Compute identifier aka evaluation position scalar from recipiants_hash
-    /// and recipiant index.
-    pub(crate) fn generate(recipients_hash: &[u8; 16], index: u16) -> Self {
-        let mut pos = merlin::Transcript::new(b"Identifier");
-        pos.append_message(b"RecipientsHash", recipients_hash);
-        pos.append_message(b"i", &index.to_le_bytes()[..]);
-        Identifier(pos.challenge_scalar(b"evaluation position"))
-    }
-}
-
 /// The contents of the message destined to all participants.
 pub struct MessageContent {
     pub(crate) sender: PublicKey,

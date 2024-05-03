@@ -1,10 +1,15 @@
 use core::iter;
-
 use alloc::vec::Vec;
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
+use crate::{context::SigningTranscript, SecretKey};
 
-use crate::SecretKey;
+pub(crate) fn generate_identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
+    let mut pos = merlin::Transcript::new(b"Identifier");
+    pos.append_message(b"RecipientsHash", recipients_hash);
+    pos.append_message(b"i", &index.to_le_bytes()[..]);
+    pos.challenge_scalar(b"evaluation position")
+}
 
 /// Evaluate the polynomial with the given coefficients (constant term first)
 /// at the point x=identifier using Horner's method.

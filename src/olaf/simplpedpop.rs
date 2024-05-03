@@ -5,13 +5,13 @@ use alloc::vec::Vec;
 use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
 use rand_core::RngCore;
-use crate::{context::SigningTranscript, olaf::data_structures::Identifier, Keypair, PublicKey};
+use crate::{context::SigningTranscript, verify_batch, Keypair, PublicKey};
 use super::{
     data_structures::{AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters},
     errors::{DKGError, DKGResult},
     utils::{
         derive_secret_key_from_secret, evaluate_polynomial, evaluate_secret_share,
-        generate_coefficients,
+        generate_coefficients, generate_identifier,
     },
 };
 
@@ -98,8 +98,8 @@ impl Keypair {
         let mut scalar_evaluations = Vec::new();
 
         for i in 0..parameters.participants {
-            let identifier = Identifier::generate(&recipients_hash, i);
-            let scalar_evaluation = evaluate_polynomial(&identifier.0, &coefficients);
+            let identifier = generate_identifier(&recipients_hash, i);
+            let scalar_evaluation = evaluate_polynomial(&identifier, &coefficients);
             scalar_evaluations.push(scalar_evaluation);
         }
 
@@ -146,17 +146,20 @@ impl Keypair {
             ciphertexts,
         );
 
-        let mut m = Transcript::new(b"signature");
-        m.append_message(b"message", &message_content.to_bytes());
+        let mut t_sig = Transcript::new(b"signature");
+        t_sig.append_message(b"message", &message_content.to_bytes());
+        let signature = self.sign(t_sig);
 
-        let signature = self.sign(m.clone());
         let secret_key = derive_secret_key_from_secret(
             coefficients
                 .first()
                 .expect("This never fails because the minimum threshold is 2"),
             &mut rng,
         );
-        let proof_of_possession = secret_key.sign(m, pk);
+
+        let mut t_pop = Transcript::new(b"pop");
+        t_pop.append_message(b"message", &message_content.to_bytes());
+        let proof_of_possession = secret_key.sign(t_pop, pk);
 
         Ok(AllMessage::new(message_content, proof_of_possession, signature))
     }
@@ -166,8 +169,6 @@ impl Keypair {
         &self,
         messages: &[AllMessage],
     ) -> DKGResult<(DKGOutput, Scalar)> {
-        // It's irrelevant if we're in the recipiants or not ???
-
         let mut secret_shares = Vec::new();
         let mut transcript = Transcript::new(b"dkg output");
         let mut identified = false;
@@ -200,7 +201,29 @@ impl Keypair {
             verifying_keys.push(RistrettoPoint::identity());
         }
 
+        let mut public_keys = Vec::with_capacity(participants);
+        let mut proofs_of_possession = Vec::with_capacity(participants);
+
+        let mut senders = Vec::with_capacity(participants);
+        let mut signatures = Vec::with_capacity(participants);
+
+        let mut t_sigs = Vec::with_capacity(participants);
+        let mut t_pops = Vec::with_capacity(participants);
+
         for message in messages {
+            // The public keys are the secret commitments of the participants
+            let public_key =
+                PublicKey::from_point(
+                    *message.content.point_polynomial.first().expect(
+                        "This never fails because the minimum threshold of the protocol is 2",
+                    ),
+                );
+            public_keys.push(public_key);
+            proofs_of_possession.push(message.proof_of_possession);
+
+            senders.push(message.content.sender);
+            signatures.push(message.signature);
+
             // Recreate the encryption environment
             let mut enc = merlin::Transcript::new(b"Encryption");
             message.content.parameters.commit(&mut enc);
@@ -221,22 +244,14 @@ impl Keypair {
             let encryption_nonce = message.content.encryption_nonce;
             enc.append_message(b"nonce", &encryption_nonce);
 
-            let mut m = Transcript::new(b"signature");
-            m.append_message(b"message", &message.content.to_bytes());
+            let mut t_sig = Transcript::new(b"signature");
+            t_sig.append_message(b"message", &message.content.to_bytes());
 
-            let pk = PublicKey::from_point(
-                *message
-                    .content
-                    .point_polynomial
-                    .first()
-                    .expect("This never fails because the minimum threshold is 2"),
-            );
+            let mut t_pop = Transcript::new(b"pop");
+            t_pop.append_message(b"message", &message.content.to_bytes());
 
-            // TODO: Verify batch
-            pk.verify(m.clone(), &message.proof_of_possession)
-                .map_err(DKGError::InvalidProofOfPossession)?;
-
-            sender.verify(m, &message.signature).map_err(DKGError::InvalidSignature)?;
+            t_sigs.push(t_sig);
+            t_pops.push(t_pop);
 
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
                 let original_scalar = self.decrypt_secret_share(
@@ -248,7 +263,7 @@ impl Keypair {
                 );
 
                 let evaluation = evaluate_secret_share(
-                    Identifier::generate(&recipients_hash, i as u16).0,
+                    generate_identifier(&recipients_hash, i as u16),
                     &point_polynomial,
                 );
 
@@ -264,6 +279,12 @@ impl Keypair {
                 }
             }
         }
+
+        verify_batch(t_pops, &proofs_of_possession[..], &public_keys[..], false)
+            .map_err(DKGError::InvalidProofOfPossession)?;
+
+        verify_batch(t_sigs, &signatures[..], &senders[..], false)
+            .map_err(DKGError::InvalidProofOfPossession)?;
 
         for verifying_key in &verifying_keys {
             if verifying_key == &RistrettoPoint::identity() {
@@ -302,226 +323,5 @@ impl Keypair {
         let dkg_output = DKGOutput::new(self.public, dkg_output_content, signature);
 
         Ok((dkg_output, total_secret_share))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use curve25519_dalek::ristretto::RistrettoPoint;
-    use curve25519_dalek::scalar::Scalar;
-    use rand::rngs::OsRng;
-
-    #[test]
-    fn test_serialize_deserialize() {
-        let sender = Keypair::generate();
-        let encryption_nonce = [1u8; 16];
-        let parameters = Parameters { participants: 2, threshold: 1 };
-        let recipients_hash = [2u8; 16];
-        let point_polynomial =
-            vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
-        let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
-        let proof_of_possession = sender.sign(Transcript::new(b"pop"));
-        let signature = sender.sign(Transcript::new(b"sig"));
-
-        let message_content = MessageContent::new(
-            sender.public,
-            encryption_nonce,
-            parameters,
-            recipients_hash,
-            point_polynomial,
-            ciphertexts,
-        );
-
-        let message = AllMessage::new(message_content, proof_of_possession, signature);
-
-        // Serialize the message
-        let bytes = message.to_bytes();
-
-        // Deserialize the message
-        let deserialized_message = AllMessage::from_bytes(&bytes).expect("Failed to deserialize");
-
-        // Assertions to ensure that the deserialized message matches the original message
-        assert_eq!(
-            message.content.sender.to_bytes(),
-            deserialized_message.content.sender.to_bytes()
-        );
-        assert_eq!(message.content.encryption_nonce, deserialized_message.content.encryption_nonce);
-        assert_eq!(
-            message.content.parameters.participants,
-            deserialized_message.content.parameters.participants
-        );
-        assert_eq!(
-            message.content.parameters.threshold,
-            deserialized_message.content.parameters.threshold
-        );
-        assert_eq!(message.content.recipients_hash, deserialized_message.content.recipients_hash);
-        assert_eq!(
-            message.content.point_polynomial.len(),
-            deserialized_message.content.point_polynomial.len()
-        );
-        assert!(message
-            .content
-            .point_polynomial
-            .iter()
-            .zip(deserialized_message.content.point_polynomial.iter())
-            .all(|(a, b)| a.compress() == b.compress()));
-        assert_eq!(
-            message.content.ciphertexts.len(),
-            deserialized_message.content.ciphertexts.len()
-        );
-        assert!(message
-            .content
-            .ciphertexts
-            .iter()
-            .zip(deserialized_message.content.ciphertexts.iter())
-            .all(|(a, b)| a == b));
-        assert_eq!(message.proof_of_possession.R, deserialized_message.proof_of_possession.R);
-        assert_eq!(message.proof_of_possession.s, deserialized_message.proof_of_possession.s);
-        assert_eq!(message.signature.R, deserialized_message.signature.R);
-        assert_eq!(message.signature.s, deserialized_message.signature.s);
-    }
-
-    #[test]
-    fn test_simplpedpop_protocol() {
-        // Create participants
-        let threshold = 2;
-        let participants = 2;
-        let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
-        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
-
-        // Each participant creates an AllMessage
-        let mut all_messages = Vec::new();
-        for i in 0..participants {
-            let message: AllMessage =
-                keypairs[i].simplpedpop_contribute_all(threshold, public_keys.clone()).unwrap();
-            all_messages.push(message);
-        }
-
-        let mut dkg_outputs = Vec::new();
-
-        for kp in keypairs.iter() {
-            let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
-            dkg_outputs.push(dkg_output);
-        }
-
-        // Verify that all DKG outputs are equal for group_public_key and verifying_keys
-        assert!(
-            dkg_outputs.windows(2).all(|w| w[0].0.content.group_public_key
-                == w[1].0.content.group_public_key
-                && w[0].0.content.verifying_keys.len() == w[1].0.content.verifying_keys.len()
-                && w[0]
-                    .0
-                    .content
-                    .verifying_keys
-                    .iter()
-                    .zip(w[1].0.content.verifying_keys.iter())
-                    .all(|(a, b)| a == b)),
-            "All DKG outputs should have identical group public keys and verifying keys."
-        );
-
-        // Verify that all verifying_keys are valid
-        for i in 0..participants {
-            for j in 0..participants {
-                assert_eq!(
-                    dkg_outputs[i].0.content.verifying_keys[j].compress(),
-                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
-                    "Verification of total secret shares failed!"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_scalar() {
-        // Create a sender and a recipient Keypair
-        let sender = Keypair::generate();
-        let recipient = Keypair::generate();
-
-        // Generate a scalar to encrypt
-        let original_scalar = Scalar::random(&mut OsRng);
-
-        let nonce = [0; 16];
-
-        // Encrypt the scalar using sender's keypair and recipient's public key
-        let encrypted_scalar = sender.encrypt_secret_share(
-            Transcript::new(b"enc"),
-            &recipient.public,
-            &original_scalar,
-            &nonce,
-            0,
-        );
-
-        // Decrypt the scalar using recipient's keypair
-        let decrypted_scalar = recipient.decrypt_secret_share(
-            Transcript::new(b"enc"),
-            &sender.public,
-            &encrypted_scalar,
-            &nonce,
-            0,
-        );
-
-        // Check that the decrypted scalar matches the original scalar
-        assert_eq!(
-            decrypted_scalar, original_scalar,
-            "Decrypted scalar should match the original scalar."
-        );
-    }
-
-    #[test]
-    fn test_dkg_output_serialization() {
-        let mut rng = OsRng;
-        let group_public_key = RistrettoPoint::random(&mut rng);
-        let verifying_keys = vec![
-            RistrettoPoint::random(&mut rng),
-            RistrettoPoint::random(&mut rng),
-            RistrettoPoint::random(&mut rng),
-        ];
-
-        let dkg_output_content = DKGOutputContent {
-            group_public_key: PublicKey::from_point(group_public_key),
-            verifying_keys,
-        };
-
-        let keypair = Keypair::generate();
-        let signature = keypair.sign(Transcript::new(b"test"));
-
-        let dkg_output =
-            DKGOutput { sender: keypair.public, content: dkg_output_content, signature };
-
-        // Serialize the DKGOutput
-        let bytes = dkg_output.to_bytes();
-
-        // Deserialize the DKGOutput
-        let deserialized_dkg_output =
-            DKGOutput::from_bytes(&bytes).expect("Deserialization failed");
-
-        // Check if the deserialized content matches the original
-        assert_eq!(
-            deserialized_dkg_output.content.group_public_key.as_compressed(),
-            dkg_output.content.group_public_key.as_compressed(),
-            "Group public keys do not match"
-        );
-
-        assert_eq!(
-            deserialized_dkg_output.content.verifying_keys.len(),
-            dkg_output.content.verifying_keys.len(),
-            "Verifying keys counts do not match"
-        );
-
-        assert!(
-            deserialized_dkg_output
-                .content
-                .verifying_keys
-                .iter()
-                .zip(dkg_output.content.verifying_keys.iter())
-                .all(|(a, b)| a == b),
-            "Verifying keys do not match"
-        );
-
-        assert_eq!(
-            deserialized_dkg_output.signature.s, dkg_output.signature.s,
-            "Signatures do not match"
-        );
     }
 }
