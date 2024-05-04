@@ -21,53 +21,6 @@ use super::{
 };
 
 impl Keypair {
-    /// Encrypt a single scalar evaluation for a single recipient.
-    pub fn encrypt_secret_share<T: SigningTranscript>(
-        &self,
-        mut transcript: T,
-        recipient: &PublicKey,
-        scalar_evaluation: &Scalar,
-        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
-        i: usize,
-    ) -> Scalar {
-        transcript.commit_bytes(b"i", &i.to_le_bytes());
-        transcript.commit_point(b"contributor", self.public.as_compressed());
-        transcript.commit_point(b"recipient", recipient.as_compressed());
-
-        transcript.commit_bytes(b"nonce", nonce);
-
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", recipient);
-
-        // Derive a scalar from the transcript to use as the encryption key
-        let encryption_scalar = transcript.challenge_scalar(b"encryption scalar");
-        scalar_evaluation + encryption_scalar
-    }
-
-    /// Decrypt a single scalar evaluation for a single sender.
-    pub fn decrypt_secret_share<T: SigningTranscript>(
-        &self,
-        mut transcript: T,
-        sender: &PublicKey,
-        encrypted_scalar: &Scalar,
-        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
-        i: usize,
-    ) -> Scalar {
-        transcript.commit_bytes(b"i", &i.to_le_bytes());
-        transcript.commit_point(b"contributor", sender.as_compressed());
-        transcript.commit_point(b"recipient", self.public.as_compressed());
-
-        // Append the same nonce used during encryption
-        transcript.commit_bytes(b"nonce", nonce);
-
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", sender);
-
-        // Derive the same scalar from the transcript used as the encryption key
-        let decryption_scalar = transcript.challenge_scalar(b"encryption scalar");
-
-        // Decrypt the scalar by reversing the addition
-        encrypted_scalar - decryption_scalar
-    }
-
     /// First round of the SimplPedPoP protocol.
     pub fn simplpedpop_contribute_all(
         &self,
@@ -263,12 +216,11 @@ impl Keypair {
                     sum_commitments(&[&total_polynomial_commitment, point_polynomial])?;
             }
 
-            for (i, ciphertext) in ciphertexts.iter().enumerate() {
-                let original_scalar =
-                    decrypt(ciphertext, &self.secret.key, &sender.into_point(), b"secret share");
-
-                if original_scalar.is_ok() {
-                    secret_shares.push(original_scalar.unwrap());
+            for ciphertext in ciphertexts {
+                if let Ok(secret_share) =
+                    decrypt(ciphertext, &self.secret.key, &sender.into_point(), b"secret share")
+                {
+                    secret_shares.push(secret_share);
                     break;
                 }
             }

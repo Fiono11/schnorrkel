@@ -4,6 +4,7 @@ mod tests {
         AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters,
         CHACHA20POLY1305_LENGTH, ENCRYPTION_NONCE_LENGTH, RECIPIENTS_HASH_LENGTH,
     };
+    use crate::olaf::utils::{decrypt, encrypt};
     use crate::olaf::GENERATOR;
     use crate::{Keypair, PublicKey};
     use alloc::vec::Vec;
@@ -133,42 +134,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_secret_share() {
-        // Create a sender and a recipient Keypair
-        let sender = Keypair::generate();
-        let recipient = Keypair::generate();
-
-        // Generate a scalar to encrypt
-        let original_scalar = Scalar::random(&mut OsRng);
-
-        let nonce = [0; ENCRYPTION_NONCE_LENGTH];
-
-        // Encrypt the scalar using sender's keypair and recipient's public key
-        let encrypted_scalar = sender.encrypt_secret_share(
-            Transcript::new(b"enc"),
-            &recipient.public,
-            &original_scalar,
-            &nonce,
-            0,
-        );
-
-        // Decrypt the scalar using recipient's keypair
-        let decrypted_scalar = recipient.decrypt_secret_share(
-            Transcript::new(b"enc"),
-            &sender.public,
-            &encrypted_scalar,
-            &nonce,
-            0,
-        );
-
-        // Check that the decrypted scalar matches the original scalar
-        assert_eq!(
-            decrypted_scalar, original_scalar,
-            "Decrypted scalar should match the original scalar."
-        );
-    }
-
-    #[test]
     fn test_dkg_output_serialization() {
         let mut rng = OsRng;
         let group_public_key = RistrettoPoint::random(&mut rng);
@@ -223,5 +188,18 @@ mod tests {
             deserialized_dkg_output.signature.s, dkg_output.signature.s,
             "Signatures do not match"
         );
+    }
+
+    #[test]
+    fn test_encryption_decryption() {
+        let mut rng = OsRng;
+        let deckey = Scalar::random(&mut rng);
+        let enckey = RistrettoPoint::random(&mut rng);
+        let context = b"context";
+
+        let original_share = Scalar::random(&mut rng);
+
+        let encrypted_share = encrypt(&original_share, &deckey, &enckey, context).unwrap();
+        decrypt(&encrypted_share, &deckey, &enckey, context).unwrap();
     }
 }

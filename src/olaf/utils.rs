@@ -151,7 +151,7 @@ pub(crate) fn decrypt(
 
     let cipher = ChaCha20Poly1305::new(&key);
 
-    let plaintext = cipher.decrypt(nonce, &ciphertext[..]).map_err(DKGError::DecryptionError)?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(DKGError::DecryptionError)?;
 
     let mut bytes = [0; 32];
     bytes.copy_from_slice(&plaintext);
