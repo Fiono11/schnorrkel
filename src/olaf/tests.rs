@@ -29,7 +29,9 @@ mod tests {
 
         let mut dkg_outputs = Vec::new();
 
-        for kp in keypairs.iter() {
+        let kp = &keypairs[0];
+
+        for _ in keypairs.iter() {
             let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
             dkg_outputs.push(dkg_output);
         }

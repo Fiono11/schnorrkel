@@ -7,7 +7,10 @@ use merlin::Transcript;
 use rand_core::RngCore;
 use crate::{context::SigningTranscript, verify_batch, Keypair, PublicKey};
 use super::{
-    data_structures::{AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters},
+    data_structures::{
+        AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters,
+        ENCRYPTION_NONCE_LENGTH, RECIPIENTS_HASH_LENGTH,
+    },
     errors::{DKGError, DKGResult},
     utils::{
         derive_secret_key_from_secret, evaluate_polynomial, evaluate_secret_share,
@@ -23,7 +26,7 @@ impl Keypair {
         mut transcript: T,
         recipient: &PublicKey,
         scalar_evaluation: &Scalar,
-        nonce: &[u8; 16],
+        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
         i: usize,
     ) -> Scalar {
         transcript.commit_bytes(b"i", &i.to_le_bytes());
@@ -47,7 +50,7 @@ impl Keypair {
         mut transcript: T,
         sender: &PublicKey,
         encrypted_scalar: &Scalar,
-        nonce: &[u8; 16],
+        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
         i: usize,
     ) -> Scalar {
         transcript.commit_bytes(b"i", &i.to_le_bytes());
@@ -91,7 +94,7 @@ impl Keypair {
         for r in recipients.iter() {
             t.commit_point(b"recipient", r.as_compressed());
         }
-        let mut recipients_hash = [0u8; 16];
+        let mut recipients_hash = [0u8; RECIPIENTS_HASH_LENGTH];
         t.challenge_bytes(b"finalize", &mut recipients_hash);
 
         // uses identifier(recipients_hash, i)
@@ -115,7 +118,7 @@ impl Keypair {
         parameters.commit(&mut enc0);
         enc0.commit_point(b"contributor", self.public.as_compressed());
 
-        let mut encryption_nonce = [0u8; 16];
+        let mut encryption_nonce = [0u8; ENCRYPTION_NONCE_LENGTH];
         rng.fill_bytes(&mut encryption_nonce);
         enc0.append_message(b"nonce", &encryption_nonce);
 
@@ -147,8 +150,10 @@ impl Keypair {
             ciphertexts,
         );
 
+        let message_bytes = message_content.to_bytes();
+
         let mut t_sig = Transcript::new(b"signature");
-        t_sig.append_message(b"message", &message_content.to_bytes());
+        t_sig.append_message(b"message", &message_bytes);
         let signature = self.sign(t_sig);
 
         let secret_key = derive_secret_key_from_secret(
@@ -159,7 +164,7 @@ impl Keypair {
         );
 
         let mut t_pop = Transcript::new(b"pop");
-        t_pop.append_message(b"message", &message_content.to_bytes());
+        t_pop.append_message(b"message", &message_bytes.clone());
         let proof_of_possession = secret_key.sign(t_pop, pk);
 
         Ok(AllMessage::new(message_content, proof_of_possession, signature))
@@ -187,8 +192,6 @@ impl Keypair {
         let recipients_hash = &messages[0].content.recipients_hash;
 
         let mut secret_shares = Vec::new();
-        let mut transcript = Transcript::new(b"dkg output");
-        let mut identified = false;
 
         let mut verifying_keys = Vec::new();
         for _ in 0..participants {
@@ -244,11 +247,13 @@ impl Keypair {
             let encryption_nonce = message.content.encryption_nonce;
             enc.append_message(b"nonce", &encryption_nonce);
 
+            let message_bytes = &message.content.to_bytes();
+
             let mut t_sig = Transcript::new(b"signature");
-            t_sig.append_message(b"message", &message.content.to_bytes());
+            t_sig.append_message(b"message", &message_bytes);
 
             let mut t_pop = Transcript::new(b"pop");
-            t_pop.append_message(b"message", &message.content.to_bytes());
+            t_pop.append_message(b"message", &message_bytes.clone());
 
             t_sigs.push(t_sig);
             t_pops.push(t_pop);
@@ -270,11 +275,6 @@ impl Keypair {
                 verifying_keys[i] += evaluation;
 
                 if evaluation == original_scalar * GENERATOR {
-                    if !identified {
-                        // This is to distinguish different output messages in the case that recipients != participants
-                        transcript.append_u64(b"id", i as u64);
-                        identified = true;
-                    }
                     secret_shares.push(original_scalar);
                 }
             }
@@ -285,12 +285,6 @@ impl Keypair {
 
         verify_batch(t_sigs, &signatures[..], &senders[..], false)
             .map_err(DKGError::InvalidProofOfPossession)?;
-
-        /*for verifying_key in &verifying_keys {
-        if verifying_key == &RistrettoPoint::identity() {
-            return Err(DKGError::InvalidVerifyingKey);
-        }
-        }*/
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
             return Err(DKGError::IncorrectNumberOfValidSecretShares {
@@ -317,6 +311,9 @@ impl Keypair {
 
         let dkg_output_content =
             DKGOutputContent::new(PublicKey::from_point(group_point), verifying_keys.to_vec());
+
+        let mut transcript = Transcript::new(b"dkg output");
+        transcript.append_message(b"content", &dkg_output_content.to_bytes());
 
         let signature = self.sign(transcript);
 

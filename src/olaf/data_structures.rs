@@ -1,7 +1,13 @@
 use alloc::vec::Vec;
 use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
-use crate::{context::SigningTranscript, PublicKey, Signature};
+use crate::{context::SigningTranscript, PublicKey, Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use super::{errors::DKGError, MINIMUM_THRESHOLD};
+
+pub(crate) const COMPRESSED_RISTRETTO_LENGTH: usize = 32;
+pub(crate) const SCALAR_LENGTH: usize = 32;
+pub(crate) const U16_LENGTH: usize = 2;
+pub(crate) const ENCRYPTION_NONCE_LENGTH: usize = 16;
+pub(crate) const RECIPIENTS_HASH_LENGTH: usize = 16;
 
 /// The parameters of a given execution of the SimplPedPoP protocol.
 #[derive(Clone, PartialEq, Eq)]
@@ -41,9 +47,9 @@ impl Parameters {
 /// The contents of the message destined to all participants.
 pub struct MessageContent {
     pub(crate) sender: PublicKey,
-    pub(crate) encryption_nonce: [u8; 16],
+    pub(crate) encryption_nonce: [u8; ENCRYPTION_NONCE_LENGTH],
     pub(crate) parameters: Parameters,
-    pub(crate) recipients_hash: [u8; 16],
+    pub(crate) recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
     pub(crate) point_polynomial: Vec<RistrettoPoint>,
     pub(crate) ciphertexts: Vec<Scalar>,
 }
@@ -51,9 +57,9 @@ pub struct MessageContent {
 impl MessageContent {
     pub fn new(
         sender: PublicKey,
-        encryption_nonce: [u8; 16],
+        encryption_nonce: [u8; ENCRYPTION_NONCE_LENGTH],
         parameters: Parameters,
-        recipients_hash: [u8; 16],
+        recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
         point_polynomial: Vec<RistrettoPoint>,
         ciphertexts: Vec<Scalar>,
     ) -> Self {
@@ -101,51 +107,63 @@ impl MessageContent {
         let mut cursor = 0;
 
         // Deserialize PublicKey
-        let sender = PublicKey::from_bytes(&bytes[cursor..cursor + 32])
+        let sender = PublicKey::from_bytes(&bytes[cursor..cursor + PUBLIC_KEY_LENGTH])
             .map_err(DKGError::InvalidPublicKey)?;
-        cursor += 32;
+        cursor += PUBLIC_KEY_LENGTH;
 
         // Deserialize encryption_nonce
-        let encryption_nonce: [u8; 16] =
-            bytes[cursor..cursor + 16].try_into().map_err(DKGError::DeserializationError)?;
-        cursor += 16;
+        let encryption_nonce: [u8; RECIPIENTS_HASH_LENGTH] = bytes
+            [cursor..cursor + RECIPIENTS_HASH_LENGTH]
+            .try_into()
+            .map_err(DKGError::DeserializationError)?;
+        cursor += RECIPIENTS_HASH_LENGTH;
 
         // Deserialize Parameters
         let participants = u16::from_le_bytes(
-            bytes[cursor..cursor + 2].try_into().map_err(DKGError::DeserializationError)?,
+            bytes[cursor..cursor + U16_LENGTH]
+                .try_into()
+                .map_err(DKGError::DeserializationError)?,
         );
-        cursor += 2;
+        cursor += U16_LENGTH;
         let threshold = u16::from_le_bytes(
-            bytes[cursor..cursor + 2].try_into().map_err(DKGError::DeserializationError)?,
+            bytes[cursor..cursor + U16_LENGTH]
+                .try_into()
+                .map_err(DKGError::DeserializationError)?,
         );
-        cursor += 2;
+        cursor += U16_LENGTH;
 
         // Deserialize recipients_hash
-        let recipients_hash: [u8; 16] =
-            bytes[cursor..cursor + 16].try_into().map_err(DKGError::DeserializationError)?;
-        cursor += 16;
+        let recipients_hash: [u8; RECIPIENTS_HASH_LENGTH] = bytes
+            [cursor..cursor + RECIPIENTS_HASH_LENGTH]
+            .try_into()
+            .map_err(DKGError::DeserializationError)?;
+        cursor += RECIPIENTS_HASH_LENGTH;
 
         // Deserialize point_polynomial
         let mut point_polynomial = Vec::with_capacity(participants as usize);
         for _ in 0..participants {
-            let point = CompressedRistretto::from_slice(&bytes[cursor..cursor + 32])
-                .map_err(DKGError::DeserializationError)?;
+            let point = CompressedRistretto::from_slice(
+                &bytes[cursor..cursor + COMPRESSED_RISTRETTO_LENGTH],
+            )
+            .map_err(DKGError::DeserializationError)?;
             point_polynomial.push(point.decompress().ok_or(DKGError::InvalidRistrettoPoint)?);
-            cursor += 32;
+            cursor += COMPRESSED_RISTRETTO_LENGTH;
         }
 
         // Deserialize ciphertexts
         let mut ciphertexts = Vec::new();
         for _ in 0..participants {
             let ciphertext = Scalar::from_canonical_bytes(
-                bytes[cursor..cursor + 32].try_into().map_err(DKGError::DeserializationError)?,
+                bytes[cursor..cursor + SCALAR_LENGTH]
+                    .try_into()
+                    .map_err(DKGError::DeserializationError)?,
             );
             if ciphertext.is_some().unwrap_u8() == 1 {
                 ciphertexts.push(ciphertext.unwrap());
             } else {
                 return Err(DKGError::InvalidScalar);
             }
-            cursor += 32;
+            cursor += SCALAR_LENGTH;
         }
 
         Ok(MessageContent {
@@ -192,16 +210,16 @@ impl DKGOutput {
         let mut cursor = 0;
 
         // TODO: constants
-        let pk_bytes = &bytes[..32];
+        let pk_bytes = &bytes[..PUBLIC_KEY_LENGTH];
         let sender = PublicKey::from_bytes(pk_bytes).map_err(DKGError::InvalidPublicKey)?;
-        cursor += 32;
+        cursor += PUBLIC_KEY_LENGTH;
 
-        let content_bytes = &bytes[cursor..bytes.len() - 64];
+        let content_bytes = &bytes[cursor..bytes.len() - SIGNATURE_LENGTH];
         let content = DKGOutputContent::from_bytes(content_bytes)?;
 
-        cursor = bytes.len() - 64;
+        cursor = bytes.len() - SIGNATURE_LENGTH;
         // Deserialize signature (Signature)
-        let signature = Signature::from_bytes(&bytes[cursor..cursor + 64])
+        let signature = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
             .map_err(DKGError::InvalidSignature)?;
 
         Ok(DKGOutput { sender, content, signature })
@@ -246,24 +264,24 @@ impl DKGOutputContent {
         let mut cursor = 0;
 
         // Deserialize the group public key
-        let public_key_bytes = &bytes[cursor..cursor + 32]; // Ristretto points are 32 bytes when compressed
-        cursor += 32;
+        let public_key_bytes = &bytes[cursor..cursor + PUBLIC_KEY_LENGTH]; // Ristretto points are 32 bytes when compressed
+        cursor += PUBLIC_KEY_LENGTH;
         let compressed_public_key = CompressedRistretto::from_slice(public_key_bytes)
             .map_err(DKGError::DeserializationError)?;
         let group_public_key =
             compressed_public_key.decompress().ok_or(DKGError::InvalidRistrettoPoint)?;
 
         // Deserialize the number of verifying keys
-        let key_count_bytes = &bytes[cursor..cursor + 2];
-        cursor += 2;
+        let key_count_bytes = &bytes[cursor..cursor + U16_LENGTH];
+        cursor += U16_LENGTH;
         let key_count =
             u16::from_le_bytes(key_count_bytes.try_into().map_err(DKGError::DeserializationError)?);
 
         // Deserialize each verifying key
         let mut verifying_keys = Vec::with_capacity(key_count as usize);
         for _ in 0..key_count {
-            let key_bytes = &bytes[cursor..cursor + 32];
-            cursor += 32;
+            let key_bytes = &bytes[cursor..cursor + COMPRESSED_RISTRETTO_LENGTH];
+            cursor += COMPRESSED_RISTRETTO_LENGTH;
             let compressed_key = CompressedRistretto::from_slice(key_bytes)
                 .map_err(DKGError::DeserializationError)?;
             let key = compressed_key.decompress().ok_or(DKGError::InvalidRistrettoPoint)?;
@@ -321,12 +339,12 @@ impl AllMessage {
         cursor += content.to_bytes().len();
 
         // Deserialize proof_of_possession (Signature)
-        let proof_of_possession = Signature::from_bytes(&bytes[cursor..cursor + 64])
+        let proof_of_possession = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
             .map_err(DKGError::InvalidSignature)?;
-        cursor += 64;
+        cursor += SIGNATURE_LENGTH;
 
         // Deserialize signature (Signature)
-        let signature = Signature::from_bytes(&bytes[cursor..cursor + 64])
+        let signature = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
             .map_err(DKGError::InvalidSignature)?;
 
         Ok(AllMessage { content, proof_of_possession, signature })
