@@ -50,4 +50,8 @@ pub enum DKGError {
     IncorrectNumberOfEncryptedShares,
     /// The verifying key is invalid.
     InvalidVerifyingKey,
+    /// Decryption error when decrypting an encrypted secret share.
+    DecryptionError(chacha20poly1305::Error),
+    /// Encryption error when encrypting the secret share.
+    EncryptionError(chacha20poly1305::Error),
 }

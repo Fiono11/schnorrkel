@@ -1,6 +1,7 @@
 //! SimplPedPoP data structures.
 
 use alloc::vec::Vec;
+use chacha20poly1305::ChaChaPoly1305;
 use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
 use crate::{context::SigningTranscript, PublicKey, Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use super::{errors::DKGError, MINIMUM_THRESHOLD};
@@ -53,7 +54,8 @@ pub struct MessageContent {
     pub(crate) parameters: Parameters,
     pub(crate) recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
     pub(crate) point_polynomial: Vec<RistrettoPoint>,
-    pub(crate) ciphertexts: Vec<Scalar>,
+    //pub(crate) ciphertexts: Vec<Scalar>,
+    pub(crate) ciphertexts: Vec<Vec<u8>>,
 }
 
 impl MessageContent {
@@ -64,7 +66,7 @@ impl MessageContent {
         parameters: Parameters,
         recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
         point_polynomial: Vec<RistrettoPoint>,
-        ciphertexts: Vec<Scalar>,
+        ciphertexts: Vec<Vec<u8>>,
     ) -> Self {
         Self {
             sender,
@@ -99,7 +101,7 @@ impl MessageContent {
 
         // Serialize ciphertexts (list of Scalars)
         for ciphertext in &self.ciphertexts {
-            bytes.extend(ciphertext.to_bytes());
+            bytes.extend(ciphertext);
         }
 
         bytes
@@ -156,7 +158,9 @@ impl MessageContent {
         // Deserialize ciphertexts
         let mut ciphertexts = Vec::new();
         for _ in 0..participants {
-            let ciphertext = Scalar::from_canonical_bytes(
+            let ciphertext = bytes[cursor..cursor + 64].to_vec();
+            ciphertexts.push(ciphertext);
+            /*let ciphertext = Scalar::from_canonical_bytes(
                 bytes[cursor..cursor + SCALAR_LENGTH]
                     .try_into()
                     .map_err(DKGError::DeserializationError)?,
@@ -165,7 +169,8 @@ impl MessageContent {
                 ciphertexts.push(ciphertext.unwrap());
             } else {
                 return Err(DKGError::InvalidScalar);
-            }
+                }*/
+
             cursor += SCALAR_LENGTH;
         }
 

@@ -1,9 +1,12 @@
 use core::iter;
 use alloc::vec::Vec;
+use aead::{generic_array::GenericArray, KeyInit, KeySizeUser};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
+use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use crate::{context::SigningTranscript, SecretKey};
-use super::errors::DKGError;
+use super::errors::{DKGError, DKGResult};
 
 pub(crate) fn generate_identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
     let mut pos = merlin::Transcript::new(b"Identifier");
@@ -91,4 +94,67 @@ pub(crate) fn sum_commitments(
         }
     }
     Ok(group_commitment)
+}
+
+pub(crate) fn encrypt(
+    scalar: &Scalar,
+    decryption_key: &Scalar,
+    encryption_key: &RistrettoPoint,
+    context: &[u8],
+) -> DKGResult<Vec<u8>> {
+    let shared_secret = decryption_key * encryption_key;
+
+    let mut transcript = Transcript::new(b"encryption");
+    transcript.commit_point(b"shared secret", &shared_secret.compress());
+    transcript.append_message(b"context", context);
+
+    let mut bytes = [0; 12];
+    transcript.challenge_bytes(b"nonce", &mut bytes);
+
+    let nonce = Nonce::from_slice(&bytes[..]);
+
+    let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
+        Default::default();
+
+    transcript.challenge_bytes(b"", key.as_mut_slice());
+
+    let cipher = ChaCha20Poly1305::new(&key);
+
+    let ciphertext: Vec<u8> = cipher
+        .encrypt(nonce, &scalar.as_bytes()[..])
+        .map_err(DKGError::EncryptionError)?;
+
+    Ok(ciphertext)
+}
+
+pub(crate) fn decrypt(
+    ciphertext: &[u8],
+    decryption_key: &Scalar,
+    encryption_key: &RistrettoPoint,
+    context: &[u8],
+) -> DKGResult<Scalar> {
+    let shared_secret = decryption_key * encryption_key;
+
+    let mut transcript = Transcript::new(b"encryption");
+    transcript.commit_point(b"shared secret", &shared_secret.compress());
+    transcript.append_message(b"context", context);
+
+    let mut bytes = [0; 12];
+    transcript.challenge_bytes(b"nonce", &mut bytes);
+
+    let nonce = Nonce::from_slice(&bytes);
+
+    let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
+        Default::default();
+
+    transcript.challenge_bytes(b"", key.as_mut_slice());
+
+    let cipher = ChaCha20Poly1305::new(&key);
+
+    let plaintext = cipher.decrypt(nonce, &ciphertext[..]).map_err(DKGError::DecryptionError)?;
+
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&plaintext);
+
+    Ok(Scalar::from_bytes_mod_order(bytes))
 }
