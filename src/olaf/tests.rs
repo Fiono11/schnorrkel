@@ -15,9 +15,9 @@ mod tests {
     fn test_simplpedpop_protocol() {
         // Create participants
         let threshold = 2;
-        let participants = 2;
+        let participants = 3;
         let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
-        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
+        let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public).collect();
 
         // Each participant creates an AllMessage
         let mut all_messages = Vec::new();

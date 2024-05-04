@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
 use crate::{context::SigningTranscript, PublicKey, Signature};
-use super::errors::DKGError;
+use super::{errors::DKGError, MINIMUM_THRESHOLD};
 
 /// The parameters of a given execution of the SimplPedPoP protocol.
 #[derive(Clone, PartialEq, Eq)]
@@ -17,11 +17,11 @@ impl Parameters {
     }
 
     pub(crate) fn validate(&self) -> Result<(), DKGError> {
-        if self.threshold < 2 {
+        if self.threshold < MINIMUM_THRESHOLD {
             return Err(DKGError::InsufficientThreshold);
         }
 
-        if self.participants < 2 {
+        if self.participants < MINIMUM_THRESHOLD {
             return Err(DKGError::InvalidNumberOfParticipants);
         }
 

@@ -2,7 +2,7 @@
 //! on Pedersen's DKG. All of them have as the fundamental building block the Shamir's Secret Sharing scheme.
 
 use alloc::vec::Vec;
-use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, traits::Identity, RistrettoPoint, Scalar};
+use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
 use rand_core::RngCore;
 use crate::{context::SigningTranscript, verify_batch, Keypair, PublicKey};
@@ -13,6 +13,7 @@ use super::{
         derive_secret_key_from_secret, evaluate_polynomial, evaluate_secret_share,
         generate_coefficients, generate_identifier,
     },
+    GENERATOR, MINIMUM_THRESHOLD,
 };
 
 impl Keypair {
@@ -73,7 +74,7 @@ impl Keypair {
         threshold: u16,
         recipients: Vec<PublicKey>,
     ) -> DKGResult<AllMessage> {
-        let parameters = Parameters::generate(threshold, recipients.len() as u16);
+        let parameters = Parameters::generate(recipients.len() as u16, threshold);
         parameters.validate()?;
 
         let mut rng = crate::getrandom_or_panic();
@@ -105,7 +106,7 @@ impl Keypair {
 
         // Create the vector of commitments
         let point_polynomial: Vec<RistrettoPoint> =
-            coefficients.iter().map(|c| RISTRETTO_BASEPOINT_POINT * *c).collect();
+            coefficients.iter().map(|c| GENERATOR * *c).collect();
 
         // All this custom encryption mess saves 32 bytes per recipient
         // over chacha20poly1305, so maybe not worth the trouble.
@@ -169,32 +170,25 @@ impl Keypair {
         &self,
         messages: &[AllMessage],
     ) -> DKGResult<(DKGOutput, Scalar)> {
-        let mut secret_shares = Vec::new();
-        let mut transcript = Transcript::new(b"dkg output");
-        let mut identified = false;
-
-        if messages.len() < 2 {
+        if messages.len() < MINIMUM_THRESHOLD as usize {
             return Err(DKGError::InvalidNumberOfMessages);
         }
 
-        let first_params = &messages[0].content.parameters;
-        let recipients_hash = &messages[0].content.recipients_hash;
+        let participants = messages[0].content.parameters.participants as usize;
+        let threshold = messages[0].content.parameters.threshold as usize;
 
-        for message in messages {
-            if &message.content.parameters != first_params {
-                return Err(DKGError::DifferentParameters);
-            }
-            if &message.content.recipients_hash != recipients_hash {
-                return Err(DKGError::DifferentRecipientsHash);
-            }
+        if messages.len() != participants {
+            return Err(DKGError::IncorrectNumberOfMessages);
         }
 
         messages[0].content.parameters.validate()?;
 
-        let participants = messages[0].content.parameters.participants as usize;
-        if messages.len() != participants {
-            return Err(DKGError::IncorrectNumberOfMessages);
-        }
+        let first_params = &messages[0].content.parameters;
+        let recipients_hash = &messages[0].content.recipients_hash;
+
+        let mut secret_shares = Vec::new();
+        let mut transcript = Transcript::new(b"dkg output");
+        let mut identified = false;
 
         let mut verifying_keys = Vec::new();
         for _ in 0..participants {
@@ -211,6 +205,12 @@ impl Keypair {
         let mut t_pops = Vec::with_capacity(participants);
 
         for message in messages {
+            if &message.content.parameters != first_params {
+                return Err(DKGError::DifferentParameters);
+            }
+            if &message.content.recipients_hash != recipients_hash {
+                return Err(DKGError::DifferentRecipientsHash);
+            }
             // The public keys are the secret commitments of the participants
             let public_key =
                 PublicKey::from_point(
@@ -233,7 +233,7 @@ impl Keypair {
             let sender = message.content.sender;
             let ciphertexts = &message.content.ciphertexts;
 
-            if point_polynomial.len() != participants - 1 {
+            if point_polynomial.len() != threshold - 1 {
                 return Err(DKGError::IncorrectNumberOfCommitments);
             }
 
@@ -269,7 +269,7 @@ impl Keypair {
 
                 verifying_keys[i] += evaluation;
 
-                if evaluation == original_scalar * RISTRETTO_BASEPOINT_POINT {
+                if evaluation == original_scalar * GENERATOR {
                     if !identified {
                         // This is to distinguish different output messages in the case that recipients != participants
                         transcript.append_u64(b"id", i as u64);
@@ -286,11 +286,11 @@ impl Keypair {
         verify_batch(t_sigs, &signatures[..], &senders[..], false)
             .map_err(DKGError::InvalidProofOfPossession)?;
 
-        for verifying_key in &verifying_keys {
-            if verifying_key == &RistrettoPoint::identity() {
-                return Err(DKGError::InvalidVerifyingKey);
-            }
+        /*for verifying_key in &verifying_keys {
+        if verifying_key == &RistrettoPoint::identity() {
+            return Err(DKGError::InvalidVerifyingKey);
         }
+        }*/
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
             return Err(DKGError::IncorrectNumberOfValidSecretShares {
