@@ -13,8 +13,8 @@ use super::{
     },
     errors::{DKGError, DKGResult},
     utils::{
-        derive_secret_key_from_secret, evaluate_polynomial, evaluate_secret_share,
-        generate_coefficients, generate_identifier,
+        derive_secret_key_from_secret, evaluate_polynomial, evaluate_polynomial_commitment,
+        generate_coefficients, generate_identifier, sum_commitments,
     },
     GENERATOR, MINIMUM_THRESHOLD,
 };
@@ -30,18 +30,16 @@ impl Keypair {
         i: usize,
     ) -> Scalar {
         transcript.commit_bytes(b"i", &i.to_le_bytes());
-        transcript.commit_point(b"contributor", &self.public.as_compressed());
+        transcript.commit_point(b"contributor", self.public.as_compressed());
         transcript.commit_point(b"recipient", recipient.as_compressed());
 
         transcript.commit_bytes(b"nonce", nonce);
 
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &recipient);
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", recipient);
 
         // Derive a scalar from the transcript to use as the encryption key
         let encryption_scalar = transcript.challenge_scalar(b"encryption scalar");
-        let encrypted_scalar = scalar_evaluation + encryption_scalar;
-
-        encrypted_scalar
+        scalar_evaluation + encryption_scalar
     }
 
     /// Decrypt a single scalar evaluation for a single sender.
@@ -55,20 +53,18 @@ impl Keypair {
     ) -> Scalar {
         transcript.commit_bytes(b"i", &i.to_le_bytes());
         transcript.commit_point(b"contributor", sender.as_compressed());
-        transcript.commit_point(b"recipient", &self.public.as_compressed());
+        transcript.commit_point(b"recipient", self.public.as_compressed());
 
         // Append the same nonce used during encryption
         transcript.commit_bytes(b"nonce", nonce);
 
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", &sender);
+        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", sender);
 
         // Derive the same scalar from the transcript used as the encryption key
         let decryption_scalar = transcript.challenge_scalar(b"encryption scalar");
 
         // Decrypt the scalar by reversing the addition
-        let original_scalar = encrypted_scalar - decryption_scalar;
-
-        original_scalar
+        encrypted_scalar - decryption_scalar
     }
 
     /// First round of the SimplPedPoP protocol.
@@ -194,9 +190,6 @@ impl Keypair {
         let mut secret_shares = Vec::new();
 
         let mut verifying_keys = Vec::new();
-        for _ in 0..participants {
-            verifying_keys.push(RistrettoPoint::identity());
-        }
 
         let mut public_keys = Vec::with_capacity(participants);
         let mut proofs_of_possession = Vec::with_capacity(participants);
@@ -207,7 +200,11 @@ impl Keypair {
         let mut t_sigs = Vec::with_capacity(participants);
         let mut t_pops = Vec::with_capacity(participants);
 
-        for message in messages {
+        let mut group_point = RistrettoPoint::identity();
+        let mut total_secret_share = Scalar::ZERO;
+        let mut total_polynomial_commitment: Vec<RistrettoPoint> = Vec::new();
+
+        for (j, message) in messages.iter().enumerate() {
             if &message.content.parameters != first_params {
                 return Err(DKGError::DifferentParameters);
             }
@@ -221,6 +218,7 @@ impl Keypair {
                         "This never fails because the minimum threshold of the protocol is 2",
                     ),
                 );
+
             public_keys.push(public_key);
             proofs_of_possession.push(message.proof_of_possession);
 
@@ -250,7 +248,7 @@ impl Keypair {
             let message_bytes = &message.content.to_bytes();
 
             let mut t_sig = Transcript::new(b"signature");
-            t_sig.append_message(b"message", &message_bytes);
+            t_sig.append_message(b"message", message_bytes);
 
             let mut t_pop = Transcript::new(b"pop");
             t_pop.append_message(b"message", &message_bytes.clone());
@@ -258,33 +256,51 @@ impl Keypair {
             t_sigs.push(t_sig);
             t_pops.push(t_pop);
 
+            let mut decrypted = false;
+
+            if total_polynomial_commitment.is_empty() {
+                total_polynomial_commitment = point_polynomial.clone();
+            } else {
+                total_polynomial_commitment =
+                    sum_commitments(&[&total_polynomial_commitment, point_polynomial])?;
+            }
+
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
-                let original_scalar = self.decrypt_secret_share(
-                    enc.clone(),
-                    &sender,
-                    ciphertext,
-                    &encryption_nonce,
-                    i as usize,
-                );
+                if !decrypted {
+                    let evaluation = evaluate_polynomial_commitment(
+                        &generate_identifier(recipients_hash, i as u16),
+                        point_polynomial,
+                    );
 
-                let evaluation = evaluate_secret_share(
-                    generate_identifier(&recipients_hash, i as u16),
-                    &point_polynomial,
-                );
+                    let original_scalar = self.decrypt_secret_share(
+                        enc.clone(),
+                        &sender,
+                        ciphertext,
+                        &encryption_nonce,
+                        i,
+                    );
 
-                verifying_keys[i] += evaluation;
-
-                if evaluation == original_scalar * GENERATOR {
-                    secret_shares.push(original_scalar);
+                    if evaluation == original_scalar * GENERATOR {
+                        secret_shares.push(original_scalar);
+                        decrypted = true;
+                    }
                 }
             }
+
+            total_secret_share += secret_shares[j];
+
+            group_point += message
+                .content
+                .point_polynomial
+                .first()
+                .expect("This never fails because the minimum threshold is 2");
         }
 
-        verify_batch(t_pops, &proofs_of_possession[..], &public_keys[..], false)
-            .map_err(DKGError::InvalidProofOfPossession)?;
-
-        verify_batch(t_sigs, &signatures[..], &senders[..], false)
-            .map_err(DKGError::InvalidProofOfPossession)?;
+        for i in 0..participants {
+            let identifier = generate_identifier(recipients_hash, i as u16);
+            verifying_keys
+                .push(evaluate_polynomial_commitment(&identifier, &total_polynomial_commitment));
+        }
 
         if secret_shares.len() != messages[0].content.parameters.participants as usize {
             return Err(DKGError::IncorrectNumberOfValidSecretShares {
@@ -293,24 +309,14 @@ impl Keypair {
             });
         }
 
-        let mut total_secret_share = Scalar::ZERO;
+        verify_batch(t_pops, &proofs_of_possession[..], &public_keys[..], false)
+            .map_err(DKGError::InvalidProofOfPossession)?;
 
-        for secret_share in secret_shares {
-            total_secret_share += secret_share;
-        }
-
-        let mut group_point = RistrettoPoint::identity();
-
-        for message in messages {
-            group_point += message
-                .content
-                .point_polynomial
-                .first()
-                .expect("This never fails because the minimum threshold is 2");
-        }
+        verify_batch(t_sigs, &signatures[..], &senders[..], false)
+            .map_err(DKGError::InvalidProofOfPossession)?;
 
         let dkg_output_content =
-            DKGOutputContent::new(PublicKey::from_point(group_point), verifying_keys.to_vec());
+            DKGOutputContent::new(PublicKey::from_point(group_point), verifying_keys);
 
         let mut transcript = Transcript::new(b"dkg output");
         transcript.append_message(b"content", &dkg_output_content.to_bytes());

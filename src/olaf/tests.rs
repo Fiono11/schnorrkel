@@ -2,10 +2,11 @@
 mod tests {
     use crate::olaf::data_structures::{
         AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters,
+        ENCRYPTION_NONCE_LENGTH, RECIPIENTS_HASH_LENGTH,
     };
+    use crate::olaf::GENERATOR;
     use crate::{Keypair, PublicKey};
     use alloc::vec::Vec;
-    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
     use curve25519_dalek::ristretto::RistrettoPoint;
     use curve25519_dalek::scalar::Scalar;
     use merlin::Transcript;
@@ -29,9 +30,7 @@ mod tests {
 
         let mut dkg_outputs = Vec::new();
 
-        let kp = &keypairs[0];
-
-        for _ in keypairs.iter() {
+        for kp in keypairs.iter() {
             let dkg_output = kp.simplpedpop_recipient_all(&all_messages).unwrap();
             dkg_outputs.push(dkg_output);
         }
@@ -56,7 +55,7 @@ mod tests {
             for j in 0..participants {
                 assert_eq!(
                     dkg_outputs[i].0.content.verifying_keys[j].compress(),
-                    (dkg_outputs[j].1 * RISTRETTO_BASEPOINT_POINT).compress(),
+                    (dkg_outputs[j].1 * GENERATOR).compress(),
                     "Verification of total secret shares failed!"
                 );
             }
@@ -66,9 +65,9 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_all_message() {
         let sender = Keypair::generate();
-        let encryption_nonce = [1u8; 16];
+        let encryption_nonce = [1u8; ENCRYPTION_NONCE_LENGTH];
         let parameters = Parameters { participants: 2, threshold: 1 };
-        let recipients_hash = [2u8; 16];
+        let recipients_hash = [2u8; RECIPIENTS_HASH_LENGTH];
         let point_polynomial =
             vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
         let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
@@ -142,7 +141,7 @@ mod tests {
         // Generate a scalar to encrypt
         let original_scalar = Scalar::random(&mut OsRng);
 
-        let nonce = [0; 16];
+        let nonce = [0; ENCRYPTION_NONCE_LENGTH];
 
         // Encrypt the scalar using sender's keypair and recipient's public key
         let encrypted_scalar = sender.encrypt_secret_share(

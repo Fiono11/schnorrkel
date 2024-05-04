@@ -1,3 +1,5 @@
+//! SimplPedPoP data structures.
+
 use alloc::vec::Vec;
 use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
 use crate::{context::SigningTranscript, PublicKey, Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
@@ -55,6 +57,7 @@ pub struct MessageContent {
 }
 
 impl MessageContent {
+    /// Creates the content of the message.
     pub fn new(
         sender: PublicKey,
         encryption_nonce: [u8; ENCRYPTION_NONCE_LENGTH],
@@ -177,6 +180,7 @@ impl MessageContent {
     }
 }
 
+/// The signed output of the SimplPedPoP protocol.
 pub struct DKGOutput {
     pub(crate) sender: PublicKey,
     pub(crate) content: DKGOutputContent,
@@ -184,6 +188,7 @@ pub struct DKGOutput {
 }
 
 impl DKGOutput {
+    /// Creates a signed SimplPedPoP output.
     pub fn new(sender: PublicKey, content: DKGOutputContent, signature: Signature) -> Self {
         Self { sender, content, signature }
     }
@@ -226,6 +231,7 @@ impl DKGOutput {
     }
 }
 
+/// The content of the signed output of the SimplPedPoP protocol.
 #[derive(Debug)]
 pub struct DKGOutputContent {
     pub(crate) group_public_key: PublicKey,
@@ -233,6 +239,7 @@ pub struct DKGOutputContent {
 }
 
 impl DKGOutputContent {
+    /// Creates the content of the SimplPedPoP output.
     pub fn new(group_public_key: PublicKey, verifying_keys: Vec<RistrettoPoint>) -> Self {
         Self { group_public_key, verifying_keys }
     }
@@ -307,6 +314,7 @@ pub struct AllMessage {
 }
 
 impl AllMessage {
+    /// Creates a new message.
     pub fn new(
         content: MessageContent,
         proof_of_possession: Signature,

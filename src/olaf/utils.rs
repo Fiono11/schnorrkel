@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use rand_core::{CryptoRng, RngCore};
 use crate::{context::SigningTranscript, SecretKey};
+use super::errors::DKGError;
 
 pub(crate) fn generate_identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
     let mut pos = merlin::Transcript::new(b"Identifier");
@@ -18,10 +19,10 @@ pub(crate) fn evaluate_polynomial(identifier: &Scalar, coefficients: &[Scalar]) 
 
     let ell_scalar = identifier;
     for coeff in coefficients.iter().skip(1).rev() {
-        value = value + *coeff;
+        value += *coeff;
         value *= ell_scalar;
     }
-    value = value + *coefficients.first().expect("coefficients must have at least one element");
+    value += *coefficients.first().expect("coefficients must have at least one element");
     value
 }
 
@@ -62,9 +63,9 @@ pub(crate) fn derive_secret_key_from_secret<R: RngCore + CryptoRng>(
         .expect("This never fails because bytes has length 64 and the key is a scalar")
 }
 
-pub(crate) fn evaluate_secret_share(
-    identifier: Scalar,
-    commitment: &Vec<RistrettoPoint>,
+pub(crate) fn evaluate_polynomial_commitment(
+    identifier: &Scalar,
+    commitment: &[RistrettoPoint],
 ) -> RistrettoPoint {
     let i = identifier;
 
@@ -74,4 +75,20 @@ pub(crate) fn evaluate_secret_share(
             (i * i_to_the_k, sum_so_far + comm_k * i_to_the_k)
         });
     result
+}
+
+pub(crate) fn sum_commitments(
+    commitments: &[&Vec<RistrettoPoint>],
+) -> Result<Vec<RistrettoPoint>, DKGError> {
+    let mut group_commitment =
+        vec![
+            RistrettoPoint::identity();
+            commitments.first().ok_or(DKGError::IncorrectNumberOfCommitments)?.len()
+        ];
+    for commitment in commitments {
+        for (i, c) in group_commitment.iter_mut().enumerate() {
+            *c += commitment.get(i).ok_or(DKGError::IncorrectNumberOfCommitments)?;
+        }
+    }
+    Ok(group_commitment)
 }
