@@ -1,8 +1,7 @@
 //! SimplPedPoP data structures.
 
 use alloc::vec::Vec;
-use chacha20poly1305::ChaChaPoly1305;
-use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
+use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint};
 use crate::{context::SigningTranscript, PublicKey, Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use super::{errors::DKGError, MINIMUM_THRESHOLD};
 
@@ -11,6 +10,7 @@ pub(crate) const SCALAR_LENGTH: usize = 32;
 pub(crate) const U16_LENGTH: usize = 2;
 pub(crate) const ENCRYPTION_NONCE_LENGTH: usize = 16;
 pub(crate) const RECIPIENTS_HASH_LENGTH: usize = 16;
+pub(crate) const CHACHA20POLY1305_LENGTH: usize = 64;
 
 /// The parameters of a given execution of the SimplPedPoP protocol.
 #[derive(Clone, PartialEq, Eq)]
@@ -158,19 +158,8 @@ impl MessageContent {
         // Deserialize ciphertexts
         let mut ciphertexts = Vec::new();
         for _ in 0..participants {
-            let ciphertext = bytes[cursor..cursor + 64].to_vec();
+            let ciphertext = bytes[cursor..cursor + CHACHA20POLY1305_LENGTH].to_vec();
             ciphertexts.push(ciphertext);
-            /*let ciphertext = Scalar::from_canonical_bytes(
-                bytes[cursor..cursor + SCALAR_LENGTH]
-                    .try_into()
-                    .map_err(DKGError::DeserializationError)?,
-            );
-            if ciphertext.is_some().unwrap_u8() == 1 {
-                ciphertexts.push(ciphertext.unwrap());
-            } else {
-                return Err(DKGError::InvalidScalar);
-                }*/
-
             cursor += SCALAR_LENGTH;
         }
 

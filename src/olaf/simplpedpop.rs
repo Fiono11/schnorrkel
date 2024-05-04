@@ -121,14 +121,6 @@ impl Keypair {
 
         let mut ciphertexts = Vec::new();
         for i in 0..parameters.participants {
-            /*let ciphertext = self.encrypt_secret_share(
-            enc0.clone(),
-            &recipients[i as usize],
-            &scalar_evaluations[i as usize],
-            &encryption_nonce,
-            i as usize,
-            );*/
-
             let ciphertext = encrypt(
                 &scalar_evaluations[i as usize],
                 &self.secret.key,
@@ -272,19 +264,6 @@ impl Keypair {
             }
 
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
-                /*let evaluation = evaluate_polynomial_commitment(
-                &generate_identifier(recipients_hash, i as u16),
-                point_polynomial,
-                );*/
-
-                /*let original_scalar = self.decrypt_secret_share(
-                enc.clone(),
-                &sender,
-                ciphertext,
-                &encryption_nonce,
-                i,
-                );*/
-
                 let original_scalar =
                     decrypt(ciphertext, &self.secret.key, &sender.into_point(), b"secret share");
 
@@ -292,11 +271,6 @@ impl Keypair {
                     secret_shares.push(original_scalar.unwrap());
                     break;
                 }
-
-                //if evaluation == original_scalar * GENERATOR {
-                //secret_shares.push(original_scalar);
-                //break;
-                //}
             }
 
             total_secret_share += secret_shares[j];

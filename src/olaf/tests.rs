@@ -2,7 +2,7 @@
 mod tests {
     use crate::olaf::data_structures::{
         AllMessage, DKGOutput, DKGOutputContent, MessageContent, Parameters,
-        ENCRYPTION_NONCE_LENGTH, RECIPIENTS_HASH_LENGTH,
+        CHACHA20POLY1305_LENGTH, ENCRYPTION_NONCE_LENGTH, RECIPIENTS_HASH_LENGTH,
     };
     use crate::olaf::GENERATOR;
     use crate::{Keypair, PublicKey};
@@ -70,7 +70,7 @@ mod tests {
         let recipients_hash = [2u8; RECIPIENTS_HASH_LENGTH];
         let point_polynomial =
             vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
-        let ciphertexts = vec![vec![1; 64], vec![1; 64]];
+        let ciphertexts = vec![vec![1; CHACHA20POLY1305_LENGTH], vec![1; CHACHA20POLY1305_LENGTH]];
         let proof_of_possession = sender.sign(Transcript::new(b"pop"));
         let signature = sender.sign(Transcript::new(b"sig"));
 
