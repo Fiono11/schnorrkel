@@ -5,8 +5,11 @@ use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
-use crate::{context::SigningTranscript, SecretKey};
-use super::errors::{DKGError, DKGResult};
+use crate::{context::SigningTranscript, PublicKey, SecretKey};
+use super::{
+    data_structures::ENCRYPTION_NONCE_LENGTH,
+    errors::{DKGError, DKGResult},
+};
 
 pub(crate) fn generate_identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
     let mut pos = merlin::Transcript::new(b"Identifier");
@@ -96,22 +99,22 @@ pub(crate) fn sum_commitments(
     Ok(group_commitment)
 }
 
-pub(crate) fn encrypt(
-    scalar: &Scalar,
-    decryption_key: &Scalar,
-    encryption_key: &RistrettoPoint,
-    context: &[u8],
+pub(crate) fn encrypt<T: SigningTranscript>(
+    scalar_evaluation: &Scalar,
+    ephemeral_key: &Scalar,
+    mut transcript: T,
+    recipient: &PublicKey,
+    nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
+    i: usize,
 ) -> DKGResult<Vec<u8>> {
-    let shared_secret = decryption_key * encryption_key;
+    transcript.commit_bytes(b"i", &i.to_le_bytes());
+    //transcript.commit_point(b"contributor", self.public.as_compressed());
+    //transcript.commit_point(b"recipient", recipient.as_compressed());
 
-    let mut transcript = Transcript::new(b"encryption");
-    transcript.commit_point(b"shared secret", &shared_secret.compress());
-    transcript.append_message(b"context", context);
+    transcript.commit_bytes(b"nonce", nonce);
 
-    let mut bytes = [0; 12];
-    transcript.challenge_bytes(b"nonce", &mut bytes);
-
-    let nonce = Nonce::from_slice(&bytes[..]);
+    //self.secret.commit_raw_key_exchange(&mut transcript, b"kex", recipient);
+    transcript.commit_point(b"key exchange", &(ephemeral_key * recipient.as_point()).compress());
 
     let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
         Default::default();
@@ -120,29 +123,31 @@ pub(crate) fn encrypt(
 
     let cipher = ChaCha20Poly1305::new(&key);
 
+    let nonce = Nonce::from_slice(&nonce[..]);
+
     let ciphertext: Vec<u8> = cipher
-        .encrypt(nonce, &scalar.as_bytes()[..])
+        .encrypt(nonce, &scalar_evaluation.to_bytes()[..])
         .map_err(DKGError::EncryptionError)?;
 
     Ok(ciphertext)
 }
 
-pub(crate) fn decrypt(
-    ciphertext: &[u8],
-    decryption_key: &Scalar,
-    encryption_key: &RistrettoPoint,
-    context: &[u8],
+pub(crate) fn decrypt<T: SigningTranscript>(
+    mut transcript: T,
+    key_exchange: &RistrettoPoint,
+    encrypted_scalar: &Vec<u8>,
+    nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
+    i: usize,
 ) -> DKGResult<Scalar> {
-    let shared_secret = decryption_key * encryption_key;
+    transcript.commit_bytes(b"i", &i.to_le_bytes());
+    //transcript.commit_point(b"contributor", sender.as_compressed());
+    //transcript.commit_point(b"recipient", self.public.as_compressed());
 
-    let mut transcript = Transcript::new(b"encryption");
-    transcript.commit_point(b"shared secret", &shared_secret.compress());
-    transcript.append_message(b"context", context);
+    // Append the same nonce used during encryption
+    transcript.commit_bytes(b"nonce", nonce);
 
-    let mut bytes = [0; 12];
-    transcript.challenge_bytes(b"nonce", &mut bytes);
-
-    let nonce = Nonce::from_slice(&bytes);
+    //self.secret.commit_raw_key_exchange(&mut transcript, b"kex", sender);
+    transcript.commit_point(b"key exchange", &key_exchange.compress());
 
     let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
         Default::default();
@@ -151,7 +156,11 @@ pub(crate) fn decrypt(
 
     let cipher = ChaCha20Poly1305::new(&key);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(DKGError::DecryptionError)?;
+    let nonce = Nonce::from_slice(&nonce[..]);
+
+    let plaintext = cipher
+        .decrypt(nonce, &encrypted_scalar[..])
+        .map_err(DKGError::DecryptionError)?;
 
     let mut bytes = [0; 32];
     bytes.copy_from_slice(&plaintext);

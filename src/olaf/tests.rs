@@ -17,7 +17,7 @@ mod tests {
     fn test_simplpedpop_protocol() {
         // Create participants
         let threshold = 2;
-        let participants = 3;
+        let participants = 2;
         let keypairs: Vec<Keypair> = (0..participants).map(|_| Keypair::generate()).collect();
         let public_keys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public).collect();
 
@@ -71,10 +71,11 @@ mod tests {
         let recipients_hash = [2u8; RECIPIENTS_HASH_LENGTH];
         let point_polynomial =
             vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
-        //let ciphertexts = vec![vec![1; CHACHA20POLY1305_LENGTH], vec![1; CHACHA20POLY1305_LENGTH]];
-        let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
+        let ciphertexts = vec![vec![1; CHACHA20POLY1305_LENGTH], vec![1; CHACHA20POLY1305_LENGTH]];
+        //let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
         let proof_of_possession = sender.sign(Transcript::new(b"pop"));
         let signature = sender.sign(Transcript::new(b"sig"));
+        let ephemeral_key = PublicKey::from_point(RistrettoPoint::random(&mut OsRng));
 
         let message_content = MessageContent::new(
             sender.public,
@@ -83,6 +84,7 @@ mod tests {
             recipients_hash,
             point_polynomial,
             ciphertexts,
+            ephemeral_key,
         );
 
         let message = AllMessage::new(message_content, proof_of_possession, signature);
@@ -194,13 +196,24 @@ mod tests {
     #[test]
     fn test_encryption_decryption() {
         let mut rng = OsRng;
-        let deckey = Scalar::random(&mut rng);
-        let enckey = RistrettoPoint::random(&mut rng);
-        let context = b"context";
+        let ephemeral_key = Keypair::generate();
+        let recipient = Keypair::generate();
+        let encryption_nonce = [1; 12];
+        let mut t = Transcript::new(b"label");
+        let key_exchange = ephemeral_key.secret.key * recipient.public.as_point();
+        let plaintext = Scalar::random(&mut rng);
 
         let original_share = Scalar::random(&mut rng);
 
-        let encrypted_share = encrypt(&original_share, &deckey, &enckey, context).unwrap();
-        decrypt(&encrypted_share, &deckey, &enckey, context).unwrap();
+        let encrypted_share = encrypt(
+            &plaintext,
+            &ephemeral_key.secret.key,
+            t.clone(),
+            &recipient.public,
+            &encryption_nonce,
+            0,
+        )
+        .unwrap();
+        decrypt(t, &key_exchange, &encrypted_share, &encryption_nonce, 0).unwrap();
     }
 }

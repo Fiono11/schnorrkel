@@ -8,7 +8,7 @@ use super::{errors::DKGError, MINIMUM_THRESHOLD};
 pub(crate) const COMPRESSED_RISTRETTO_LENGTH: usize = 32;
 pub(crate) const SCALAR_LENGTH: usize = 32;
 pub(crate) const U16_LENGTH: usize = 2;
-pub(crate) const ENCRYPTION_NONCE_LENGTH: usize = 16;
+pub(crate) const ENCRYPTION_NONCE_LENGTH: usize = 12;
 pub(crate) const RECIPIENTS_HASH_LENGTH: usize = 16;
 pub(crate) const CHACHA20POLY1305_LENGTH: usize = 64;
 
@@ -54,8 +54,9 @@ pub struct MessageContent {
     pub(crate) parameters: Parameters,
     pub(crate) recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
     pub(crate) point_polynomial: Vec<RistrettoPoint>,
-    pub(crate) ciphertexts: Vec<Scalar>,
-    //pub(crate) ciphertexts: Vec<Vec<u8>>,
+    //pub(crate) ciphertexts: Vec<Scalar>,
+    pub(crate) ciphertexts: Vec<Vec<u8>>,
+    pub(crate) ephemeral_key: PublicKey,
 }
 
 impl MessageContent {
@@ -66,8 +67,9 @@ impl MessageContent {
         parameters: Parameters,
         recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
         point_polynomial: Vec<RistrettoPoint>,
-        ciphertexts: Vec<Scalar>,
-        //ciphertexts: Vec<Vec<u8>>,
+        //ciphertexts: Vec<Scalar>,
+        ciphertexts: Vec<Vec<u8>>,
+        ephemeral_key: PublicKey,
     ) -> Self {
         Self {
             sender,
@@ -76,6 +78,7 @@ impl MessageContent {
             recipients_hash,
             point_polynomial,
             ciphertexts,
+            ephemeral_key,
         }
     }
     /// Serialize MessageContent
@@ -102,8 +105,10 @@ impl MessageContent {
 
         // Serialize ciphertexts (list of Scalars)
         for ciphertext in &self.ciphertexts {
-            bytes.extend(ciphertext.as_bytes());
+            bytes.extend(ciphertext);
         }
+
+        bytes.extend(&self.ephemeral_key.to_bytes());
 
         bytes
     }
@@ -118,11 +123,11 @@ impl MessageContent {
         cursor += PUBLIC_KEY_LENGTH;
 
         // Deserialize encryption_nonce
-        let encryption_nonce: [u8; RECIPIENTS_HASH_LENGTH] = bytes
-            [cursor..cursor + RECIPIENTS_HASH_LENGTH]
+        let encryption_nonce: [u8; ENCRYPTION_NONCE_LENGTH] = bytes
+            [cursor..cursor + ENCRYPTION_NONCE_LENGTH]
             .try_into()
             .map_err(DKGError::DeserializationError)?;
-        cursor += RECIPIENTS_HASH_LENGTH;
+        cursor += ENCRYPTION_NONCE_LENGTH;
 
         // Deserialize Parameters
         let participants = u16::from_le_bytes(
@@ -159,9 +164,9 @@ impl MessageContent {
         // Deserialize ciphertexts
         let mut ciphertexts = Vec::new();
         for _ in 0..participants {
-            //let ciphertext = bytes[cursor..cursor + CHACHA20POLY1305_LENGTH].to_vec();
-            //ciphertexts.push(ciphertext);
-            let ciphertext = Scalar::from_canonical_bytes(
+            let ciphertext = bytes[cursor..cursor + CHACHA20POLY1305_LENGTH].to_vec();
+            ciphertexts.push(ciphertext);
+            /*let ciphertext = Scalar::from_canonical_bytes(
                 bytes[cursor..cursor + SCALAR_LENGTH]
                     .try_into()
                     .map_err(DKGError::DeserializationError)?,
@@ -170,9 +175,12 @@ impl MessageContent {
                 ciphertexts.push(ciphertext.unwrap());
             } else {
                 return Err(DKGError::InvalidScalar);
-            }
-            cursor += SCALAR_LENGTH;
+                }*/
+            cursor += CHACHA20POLY1305_LENGTH;
         }
+
+        let ephemeral_key = PublicKey::from_bytes(&bytes[cursor..cursor + PUBLIC_KEY_LENGTH])
+            .map_err(DKGError::InvalidPublicKey)?;
 
         Ok(MessageContent {
             sender,
@@ -181,6 +189,7 @@ impl MessageContent {
             recipients_hash,
             point_polynomial,
             ciphertexts,
+            ephemeral_key,
         })
     }
 }

@@ -8,7 +8,7 @@ mod olaf_benches {
         let mut group = c.benchmark_group("SimplPedPoP");
 
         group
-            .sample_size(100)
+            .sample_size(10)
             .warm_up_time(std::time::Duration::from_secs(2))
             .measurement_time(std::time::Duration::from_secs(300));
 

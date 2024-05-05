@@ -1,6 +1,8 @@
 //! Implementation of the SimplPedPoP protocol (<https://eprint.iacr.org/2023/899>), a DKG based on PedPoP, which in turn is based
 //! on Pedersen's DKG. All of them have as the fundamental building block the Shamir's Secret Sharing scheme.
 
+use core::str;
+
 use alloc::vec::Vec;
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
@@ -19,6 +21,8 @@ use super::{
     },
     GENERATOR, MINIMUM_THRESHOLD,
 };
+use aead::{generic_array::GenericArray, KeyInit, KeySizeUser};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 
 impl Keypair {
     /// First round of the SimplPedPoP protocol.
@@ -72,22 +76,26 @@ impl Keypair {
         rng.fill_bytes(&mut encryption_nonce);
         enc0.append_message(b"nonce", &encryption_nonce);
 
+        let ephemeral_key = Keypair::generate();
+
         let mut ciphertexts = Vec::new();
         for i in 0..parameters.participants {
-            /*let ciphertext = encrypt(
-            &scalar_evaluations[i as usize],
-            &self.secret.key,
-            &recipients[i as usize].into_point(),
-            b"secret share",
-            )?;*/
-
-            let ciphertext = self.encrypt_secret_share(
+            let ciphertext = encrypt(
+                &scalar_evaluations[i as usize],
+                &ephemeral_key.secret.key,
                 enc0.clone(),
                 &recipients[i as usize],
-                &scalar_evaluations[i as usize],
                 &encryption_nonce,
                 i as usize,
-            );
+            )?;
+
+            /*let ciphertext = self.encrypt_secret_share(
+            enc0.clone(),
+            &recipients[i as usize],
+            &scalar_evaluations[i as usize],
+            &encryption_nonce,
+            i as usize,
+            );*/
 
             ciphertexts.push(ciphertext);
         }
@@ -105,6 +113,7 @@ impl Keypair {
             recipients_hash,
             point_polynomial,
             ciphertexts,
+            ephemeral_key.public,
         );
 
         let message_bytes = message_content.to_bytes();
@@ -224,10 +233,12 @@ impl Keypair {
                     sum_commitments(&[&total_polynomial_commitment, point_polynomial])?;
             }
 
+            let key_exchange = self.secret.key * message.content.ephemeral_key.into_point();
+
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
                 let identifier = generate_identifier(recipients_hash, i as u16);
 
-                let evaluation = evaluate_polynomial_commitment(&identifier, point_polynomial);
+                /*let evaluation = evaluate_polynomial_commitment(&identifier, point_polynomial);
 
                 let original_scalar = self.decrypt_secret_share(
                     enc.clone(),
@@ -240,10 +251,10 @@ impl Keypair {
                 if evaluation == original_scalar * GENERATOR {
                     secret_shares.push(original_scalar);
                     break;
-                }
+                    }*/
 
-                /*if let Ok(secret_share) =
-                    decrypt(ciphertext, &self.secret.key, &sender.into_point(), b"secret share")
+                if let Ok(secret_share) =
+                    decrypt(enc.clone(), &key_exchange, ciphertext, &encryption_nonce, i)
                 {
                     if secret_share * GENERATOR
                         == evaluate_polynomial_commitment(&identifier, &point_polynomial)
@@ -251,7 +262,7 @@ impl Keypair {
                         secret_shares.push(secret_share);
                         break;
                     }
-                    }*/
+                }
             }
 
             total_secret_share += secret_shares[j];
@@ -293,52 +304,5 @@ impl Keypair {
         let dkg_output = DKGOutput::new(self.public, dkg_output_content, signature);
 
         Ok((dkg_output, total_secret_share))
-    }
-
-    /// Encrypt a single scalar evaluation for a single recipient.
-    pub fn encrypt_secret_share<T: SigningTranscript>(
-        &self,
-        mut transcript: T,
-        recipient: &PublicKey,
-        scalar_evaluation: &Scalar,
-        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
-        i: usize,
-    ) -> Scalar {
-        transcript.commit_bytes(b"i", &i.to_le_bytes());
-        transcript.commit_point(b"contributor", self.public.as_compressed());
-        transcript.commit_point(b"recipient", recipient.as_compressed());
-
-        transcript.commit_bytes(b"nonce", nonce);
-
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", recipient);
-
-        // Derive a scalar from the transcript to use as the encryption key
-        let encryption_scalar = transcript.challenge_scalar(b"encryption scalar");
-        scalar_evaluation + encryption_scalar
-    }
-
-    /// Decrypt a single scalar evaluation for a single sender.
-    pub fn decrypt_secret_share<T: SigningTranscript>(
-        &self,
-        mut transcript: T,
-        sender: &PublicKey,
-        encrypted_scalar: &Scalar,
-        nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
-        i: usize,
-    ) -> Scalar {
-        transcript.commit_bytes(b"i", &i.to_le_bytes());
-        transcript.commit_point(b"contributor", sender.as_compressed());
-        transcript.commit_point(b"recipient", self.public.as_compressed());
-
-        // Append the same nonce used during encryption
-        transcript.commit_bytes(b"nonce", nonce);
-
-        self.secret.commit_raw_key_exchange(&mut transcript, b"kex", sender);
-
-        // Derive the same scalar from the transcript used as the encryption key
-        let decryption_scalar = transcript.challenge_scalar(b"encryption scalar");
-
-        // Decrypt the scalar by reversing the addition
-        encrypted_scalar - decryption_scalar
     }
 }
