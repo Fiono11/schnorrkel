@@ -1,8 +1,6 @@
 //! Implementation of the SimplPedPoP protocol (<https://eprint.iacr.org/2023/899>), a DKG based on PedPoP, which in turn is based
 //! on Pedersen's DKG. All of them have as the fundamental building block the Shamir's Secret Sharing scheme.
 
-use core::str;
-
 use alloc::vec::Vec;
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
 use merlin::Transcript;
@@ -21,8 +19,6 @@ use super::{
     },
     GENERATOR, MINIMUM_THRESHOLD,
 };
-use aead::{generic_array::GenericArray, KeyInit, KeySizeUser};
-use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 
 impl Keypair {
     /// First round of the SimplPedPoP protocol.
@@ -89,14 +85,6 @@ impl Keypair {
                 i as usize,
             )?;
 
-            /*let ciphertext = self.encrypt_secret_share(
-            enc0.clone(),
-            &recipients[i as usize],
-            &scalar_evaluations[i as usize],
-            &encryption_nonce,
-            i as usize,
-            );*/
-
             ciphertexts.push(ciphertext);
         }
 
@@ -106,6 +94,20 @@ impl Keypair {
                 .expect("This never fails because the minimum threshold is 2"),
         );
 
+        let secret = coefficients
+            .first()
+            .expect("This never fails because the minimum threshold is 2");
+
+        let secret_key = derive_secret_key_from_secret(secret, &mut rng);
+
+        let secret_commitment = point_polynomial
+            .first()
+            .expect("This never fails because the minimum threshold is 2");
+
+        let mut t_pop = Transcript::new(b"pop");
+        t_pop.append_message(b"secret commitment", secret_commitment.compress().as_bytes());
+        let proof_of_possession = secret_key.sign(t_pop, pk);
+
         let message_content = MessageContent::new(
             self.public,
             encryption_nonce,
@@ -114,26 +116,14 @@ impl Keypair {
             point_polynomial,
             ciphertexts,
             ephemeral_key.public,
+            proof_of_possession,
         );
-
-        let message_bytes = message_content.to_bytes();
 
         let mut t_sig = Transcript::new(b"signature");
-        t_sig.append_message(b"message", &message_bytes);
+        t_sig.append_message(b"message", &message_content.to_bytes());
         let signature = self.sign(t_sig);
 
-        let secret_key = derive_secret_key_from_secret(
-            coefficients
-                .first()
-                .expect("This never fails because the minimum threshold is 2"),
-            &mut rng,
-        );
-
-        let mut t_pop = Transcript::new(b"pop");
-        t_pop.append_message(b"message", &message_bytes.clone());
-        let proof_of_possession = secret_key.sign(t_pop, pk);
-
-        Ok(AllMessage::new(message_content, proof_of_possession, signature))
+        Ok(AllMessage::new(message_content, signature))
     }
 
     /// Second round of the SimplPedPoP protocol.
@@ -190,7 +180,7 @@ impl Keypair {
                 );
 
             public_keys.push(public_key);
-            proofs_of_possession.push(message.proof_of_possession);
+            proofs_of_possession.push(message.content.proof_of_possession);
 
             senders.push(message.content.sender);
             signatures.push(message.signature);
@@ -201,7 +191,6 @@ impl Keypair {
             enc.commit_point(b"contributor", message.content.sender.as_compressed());
 
             let point_polynomial = &message.content.point_polynomial;
-            let sender = message.content.sender;
             let ciphertexts = &message.content.ciphertexts;
 
             if point_polynomial.len() != threshold - 1 {
@@ -221,7 +210,10 @@ impl Keypair {
             t_sig.append_message(b"message", message_bytes);
 
             let mut t_pop = Transcript::new(b"pop");
-            t_pop.append_message(b"message", &message_bytes.clone());
+            let secret_commitment = point_polynomial
+                .first()
+                .expect("This never fails because the minimum threshold is 2");
+            t_pop.append_message(b"secret commitment", secret_commitment.compress().as_bytes());
 
             t_sigs.push(t_sig);
             t_pops.push(t_pop);
@@ -238,26 +230,11 @@ impl Keypair {
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
                 let identifier = generate_identifier(recipients_hash, i as u16);
 
-                /*let evaluation = evaluate_polynomial_commitment(&identifier, point_polynomial);
-
-                let original_scalar = self.decrypt_secret_share(
-                    enc.clone(),
-                    &sender,
-                    ciphertext,
-                    &encryption_nonce,
-                    i,
-                );
-
-                if evaluation == original_scalar * GENERATOR {
-                    secret_shares.push(original_scalar);
-                    break;
-                    }*/
-
                 if let Ok(secret_share) =
                     decrypt(enc.clone(), &key_exchange, ciphertext, &encryption_nonce, i)
                 {
                     if secret_share * GENERATOR
-                        == evaluate_polynomial_commitment(&identifier, &point_polynomial)
+                        == evaluate_polynomial_commitment(&identifier, point_polynomial)
                     {
                         secret_shares.push(secret_share);
                         break;
@@ -291,7 +268,7 @@ impl Keypair {
             .map_err(DKGError::InvalidProofOfPossession)?;
 
         verify_batch(t_sigs, &signatures[..], &senders[..], false)
-            .map_err(DKGError::InvalidProofOfPossession)?;
+            .map_err(DKGError::InvalidSignature)?;
 
         let dkg_output_content =
             DKGOutputContent::new(PublicKey::from_point(group_point), verifying_keys);

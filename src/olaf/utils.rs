@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use aead::{generic_array::GenericArray, KeyInit, KeySizeUser};
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 use curve25519_dalek::{traits::Identity, RistrettoPoint, Scalar};
-use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use crate::{context::SigningTranscript, PublicKey, SecretKey};
 use super::{
@@ -135,7 +134,7 @@ pub(crate) fn encrypt<T: SigningTranscript>(
 pub(crate) fn decrypt<T: SigningTranscript>(
     mut transcript: T,
     key_exchange: &RistrettoPoint,
-    encrypted_scalar: &Vec<u8>,
+    encrypted_scalar: &[u8],
     nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
     i: usize,
 ) -> DKGResult<Scalar> {
@@ -158,9 +157,7 @@ pub(crate) fn decrypt<T: SigningTranscript>(
 
     let nonce = Nonce::from_slice(&nonce[..]);
 
-    let plaintext = cipher
-        .decrypt(nonce, &encrypted_scalar[..])
-        .map_err(DKGError::DecryptionError)?;
+    let plaintext = cipher.decrypt(nonce, encrypted_scalar).map_err(DKGError::DecryptionError)?;
 
     let mut bytes = [0; 32];
     bytes.copy_from_slice(&plaintext);

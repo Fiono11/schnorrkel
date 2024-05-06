@@ -1,12 +1,13 @@
 //! SimplPedPoP data structures.
 
+#![allow(clippy::too_many_arguments)]
+
 use alloc::vec::Vec;
-use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint, Scalar};
+use curve25519_dalek::{ristretto::CompressedRistretto, RistrettoPoint};
 use crate::{context::SigningTranscript, PublicKey, Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use super::{errors::DKGError, MINIMUM_THRESHOLD};
 
 pub(crate) const COMPRESSED_RISTRETTO_LENGTH: usize = 32;
-pub(crate) const SCALAR_LENGTH: usize = 32;
 pub(crate) const U16_LENGTH: usize = 2;
 pub(crate) const ENCRYPTION_NONCE_LENGTH: usize = 12;
 pub(crate) const RECIPIENTS_HASH_LENGTH: usize = 16;
@@ -47,6 +48,45 @@ impl Parameters {
     }
 }
 
+/// AllMessage packs together messages for all participants.
+///
+/// We'd save bandwidth by having separate messages for each
+/// participant, but typical thresholds lie between 1/2 and 2/3,
+/// so this doubles or tripples bandwidth usage.
+pub struct AllMessage {
+    pub(crate) content: MessageContent,
+    pub(crate) signature: Signature,
+}
+
+impl AllMessage {
+    /// Creates a new message.
+    pub fn new(content: MessageContent, signature: Signature) -> Self {
+        Self { content, signature }
+    }
+    /// Serialize AllMessage
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        bytes.extend(self.content.to_bytes());
+        bytes.extend(self.signature.to_bytes());
+
+        bytes
+    }
+
+    /// Deserialize AllMessage from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<AllMessage, DKGError> {
+        let mut cursor = 0;
+
+        let content = MessageContent::from_bytes(&bytes[cursor..])?;
+        cursor += content.to_bytes().len();
+
+        let signature = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
+            .map_err(DKGError::InvalidSignature)?;
+
+        Ok(AllMessage { content, signature })
+    }
+}
+
 /// The contents of the message destined to all participants.
 pub struct MessageContent {
     pub(crate) sender: PublicKey,
@@ -54,9 +94,9 @@ pub struct MessageContent {
     pub(crate) parameters: Parameters,
     pub(crate) recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
     pub(crate) point_polynomial: Vec<RistrettoPoint>,
-    //pub(crate) ciphertexts: Vec<Scalar>,
     pub(crate) ciphertexts: Vec<Vec<u8>>,
     pub(crate) ephemeral_key: PublicKey,
+    pub(crate) proof_of_possession: Signature,
 }
 
 impl MessageContent {
@@ -67,9 +107,9 @@ impl MessageContent {
         parameters: Parameters,
         recipients_hash: [u8; RECIPIENTS_HASH_LENGTH],
         point_polynomial: Vec<RistrettoPoint>,
-        //ciphertexts: Vec<Scalar>,
         ciphertexts: Vec<Vec<u8>>,
         ephemeral_key: PublicKey,
+        proof_of_possession: Signature,
     ) -> Self {
         Self {
             sender,
@@ -79,36 +119,29 @@ impl MessageContent {
             point_polynomial,
             ciphertexts,
             ephemeral_key,
+            proof_of_possession,
         }
     }
     /// Serialize MessageContent
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
-        // Serialize PublicKey
         bytes.extend(self.sender.to_bytes());
-
-        // Serialize encryption_nonce
         bytes.extend(&self.encryption_nonce);
-
-        // Serialize Parameters
         bytes.extend(self.parameters.participants.to_le_bytes());
         bytes.extend(self.parameters.threshold.to_le_bytes());
-
-        // Serialize recipients_hash
         bytes.extend(&self.recipients_hash);
 
-        // Serialize point_polynomial (list of RistrettoPoints)
         for point in &self.point_polynomial {
             bytes.extend(point.compress().to_bytes());
         }
 
-        // Serialize ciphertexts (list of Scalars)
         for ciphertext in &self.ciphertexts {
             bytes.extend(ciphertext);
         }
 
         bytes.extend(&self.ephemeral_key.to_bytes());
+        bytes.extend(&self.proof_of_possession.to_bytes());
 
         bytes
     }
@@ -143,14 +176,12 @@ impl MessageContent {
         );
         cursor += U16_LENGTH;
 
-        // Deserialize recipients_hash
         let recipients_hash: [u8; RECIPIENTS_HASH_LENGTH] = bytes
             [cursor..cursor + RECIPIENTS_HASH_LENGTH]
             .try_into()
             .map_err(DKGError::DeserializationError)?;
         cursor += RECIPIENTS_HASH_LENGTH;
 
-        // Deserialize point_polynomial
         let mut point_polynomial = Vec::with_capacity(participants as usize);
         for _ in 0..participants {
             let point = CompressedRistretto::from_slice(
@@ -161,26 +192,19 @@ impl MessageContent {
             cursor += COMPRESSED_RISTRETTO_LENGTH;
         }
 
-        // Deserialize ciphertexts
         let mut ciphertexts = Vec::new();
         for _ in 0..participants {
             let ciphertext = bytes[cursor..cursor + CHACHA20POLY1305_LENGTH].to_vec();
             ciphertexts.push(ciphertext);
-            /*let ciphertext = Scalar::from_canonical_bytes(
-                bytes[cursor..cursor + SCALAR_LENGTH]
-                    .try_into()
-                    .map_err(DKGError::DeserializationError)?,
-            );
-            if ciphertext.is_some().unwrap_u8() == 1 {
-                ciphertexts.push(ciphertext.unwrap());
-            } else {
-                return Err(DKGError::InvalidScalar);
-                }*/
             cursor += CHACHA20POLY1305_LENGTH;
         }
 
         let ephemeral_key = PublicKey::from_bytes(&bytes[cursor..cursor + PUBLIC_KEY_LENGTH])
             .map_err(DKGError::InvalidPublicKey)?;
+        cursor += PUBLIC_KEY_LENGTH;
+
+        let proof_of_possession = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
+            .map_err(DKGError::InvalidSignature)?;
 
         Ok(MessageContent {
             sender,
@@ -190,6 +214,7 @@ impl MessageContent {
             point_polynomial,
             ciphertexts,
             ephemeral_key,
+            proof_of_possession,
         })
     }
 }
@@ -206,6 +231,7 @@ impl DKGOutput {
     pub fn new(sender: PublicKey, content: DKGOutputContent, signature: Signature) -> Self {
         Self { sender, content, signature }
     }
+
     /// Serializes the DKGOutput into bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -213,11 +239,9 @@ impl DKGOutput {
         let pk_bytes = self.sender.to_bytes();
         bytes.extend(pk_bytes);
 
-        // Serialize the content
         let content_bytes = self.content.to_bytes();
         bytes.extend(content_bytes);
 
-        // Serialize the signature
         let signature_bytes = self.signature.to_bytes();
         bytes.extend(signature_bytes);
 
@@ -228,7 +252,6 @@ impl DKGOutput {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DKGError> {
         let mut cursor = 0;
 
-        // TODO: constants
         let pk_bytes = &bytes[..PUBLIC_KEY_LENGTH];
         let sender = PublicKey::from_bytes(pk_bytes).map_err(DKGError::InvalidPublicKey)?;
         cursor += PUBLIC_KEY_LENGTH;
@@ -237,7 +260,6 @@ impl DKGOutput {
         let content = DKGOutputContent::from_bytes(content_bytes)?;
 
         cursor = bytes.len() - SIGNATURE_LENGTH;
-        // Deserialize signature (Signature)
         let signature = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
             .map_err(DKGError::InvalidSignature)?;
 
@@ -313,62 +335,5 @@ impl DKGOutputContent {
             group_public_key: PublicKey::from_point(group_public_key),
             verifying_keys,
         })
-    }
-}
-
-/// AllMessage packs together messages for all participants.
-///
-/// We'd save bandwidth by having separate messages for each
-/// participant, but typical thresholds lie between 1/2 and 2/3,
-/// so this doubles or tripples bandwidth usage.
-pub struct AllMessage {
-    pub(crate) content: MessageContent,
-    pub(crate) proof_of_possession: Signature,
-    pub(crate) signature: Signature,
-}
-
-impl AllMessage {
-    /// Creates a new message.
-    pub fn new(
-        content: MessageContent,
-        proof_of_possession: Signature,
-        signature: Signature,
-    ) -> Self {
-        Self { content, proof_of_possession, signature }
-    }
-    /// Serialize AllMessage
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
-        // Serialize MessageContent
-        bytes.extend(self.content.to_bytes());
-
-        // Serialize proof_of_possession (Signature)
-        bytes.extend(self.proof_of_possession.to_bytes());
-
-        // Serialize signature (Signature)
-        bytes.extend(self.signature.to_bytes());
-
-        bytes
-    }
-
-    /// Deserialize AllMessage from bytes
-    pub fn from_bytes(bytes: &[u8]) -> Result<AllMessage, DKGError> {
-        let mut cursor = 0;
-
-        // Deserialize MessageContent
-        let content = MessageContent::from_bytes(&bytes[cursor..])?;
-        cursor += content.to_bytes().len();
-
-        // Deserialize proof_of_possession (Signature)
-        let proof_of_possession = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
-            .map_err(DKGError::InvalidSignature)?;
-        cursor += SIGNATURE_LENGTH;
-
-        // Deserialize signature (Signature)
-        let signature = Signature::from_bytes(&bytes[cursor..cursor + SIGNATURE_LENGTH])
-            .map_err(DKGError::InvalidSignature)?;
-
-        Ok(AllMessage { content, proof_of_possession, signature })
     }
 }

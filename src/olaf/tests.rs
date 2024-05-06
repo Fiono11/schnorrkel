@@ -72,7 +72,6 @@ mod tests {
         let point_polynomial =
             vec![RistrettoPoint::random(&mut OsRng), RistrettoPoint::random(&mut OsRng)];
         let ciphertexts = vec![vec![1; CHACHA20POLY1305_LENGTH], vec![1; CHACHA20POLY1305_LENGTH]];
-        //let ciphertexts = vec![Scalar::random(&mut OsRng), Scalar::random(&mut OsRng)];
         let proof_of_possession = sender.sign(Transcript::new(b"pop"));
         let signature = sender.sign(Transcript::new(b"sig"));
         let ephemeral_key = PublicKey::from_point(RistrettoPoint::random(&mut OsRng));
@@ -85,55 +84,51 @@ mod tests {
             point_polynomial,
             ciphertexts,
             ephemeral_key,
+            proof_of_possession,
         );
 
-        let message = AllMessage::new(message_content, proof_of_possession, signature);
+        let message = AllMessage::new(message_content, signature);
 
-        // Serialize the message
         let bytes = message.to_bytes();
 
-        // Deserialize the message
         let deserialized_message = AllMessage::from_bytes(&bytes).expect("Failed to deserialize");
 
-        // Assertions to ensure that the deserialized message matches the original message
-        assert_eq!(
-            message.content.sender.to_bytes(),
-            deserialized_message.content.sender.to_bytes()
-        );
+        assert_eq!(message.content.sender, deserialized_message.content.sender);
+
         assert_eq!(message.content.encryption_nonce, deserialized_message.content.encryption_nonce);
+
         assert_eq!(
             message.content.parameters.participants,
             deserialized_message.content.parameters.participants
         );
+
         assert_eq!(
             message.content.parameters.threshold,
             deserialized_message.content.parameters.threshold
         );
+
         assert_eq!(message.content.recipients_hash, deserialized_message.content.recipients_hash);
-        assert_eq!(
-            message.content.point_polynomial.len(),
-            deserialized_message.content.point_polynomial.len()
-        );
+
         assert!(message
             .content
             .point_polynomial
             .iter()
             .zip(deserialized_message.content.point_polynomial.iter())
             .all(|(a, b)| a.compress() == b.compress()));
-        assert_eq!(
-            message.content.ciphertexts.len(),
-            deserialized_message.content.ciphertexts.len()
-        );
+
         assert!(message
             .content
             .ciphertexts
             .iter()
             .zip(deserialized_message.content.ciphertexts.iter())
             .all(|(a, b)| a == b));
-        assert_eq!(message.proof_of_possession.R, deserialized_message.proof_of_possession.R);
-        assert_eq!(message.proof_of_possession.s, deserialized_message.proof_of_possession.s);
-        assert_eq!(message.signature.R, deserialized_message.signature.R);
-        assert_eq!(message.signature.s, deserialized_message.signature.s);
+
+        assert_eq!(
+            message.content.proof_of_possession,
+            deserialized_message.content.proof_of_possession
+        );
+
+        assert_eq!(message.signature, deserialized_message.signature);
     }
 
     #[test]
@@ -198,12 +193,10 @@ mod tests {
         let mut rng = OsRng;
         let ephemeral_key = Keypair::generate();
         let recipient = Keypair::generate();
-        let encryption_nonce = [1; 12];
-        let mut t = Transcript::new(b"label");
+        let encryption_nonce = [1; ENCRYPTION_NONCE_LENGTH];
+        let t = Transcript::new(b"label");
         let key_exchange = ephemeral_key.secret.key * recipient.public.as_point();
         let plaintext = Scalar::random(&mut rng);
-
-        let original_share = Scalar::random(&mut rng);
 
         let encrypted_share = encrypt(
             &plaintext,
@@ -214,6 +207,7 @@ mod tests {
             0,
         )
         .unwrap();
+
         decrypt(t, &key_exchange, &encrypted_share, &encryption_nonce, 0).unwrap();
     }
 }
