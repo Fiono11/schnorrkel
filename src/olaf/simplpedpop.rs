@@ -32,7 +32,7 @@ impl Keypair {
 
         let mut rng = crate::getrandom_or_panic();
 
-        // We do not  recipiants.sort() because the protocol is simpler
+        // We do not recipients.sort() because the protocol is simpler
         // if we require that all contributions provide the list in
         // exactly the same order.
         //
@@ -47,7 +47,6 @@ impl Keypair {
         let mut recipients_hash = [0u8; RECIPIENTS_HASH_LENGTH];
         t.challenge_bytes(b"finalize", &mut recipients_hash);
 
-        // uses identifier(recipients_hash, i)
         let coefficients = generate_coefficients(parameters.threshold as usize - 1, &mut rng);
         let mut scalar_evaluations = Vec::new();
 
@@ -61,9 +60,6 @@ impl Keypair {
         let point_polynomial: Vec<RistrettoPoint> =
             coefficients.iter().map(|c| GENERATOR * *c).collect();
 
-        // All this custom encryption mess saves 32 bytes per recipient
-        // over chacha20poly1305, so maybe not worth the trouble.
-
         let mut enc0 = merlin::Transcript::new(b"Encryption");
         parameters.commit(&mut enc0);
         enc0.commit_point(b"contributor", self.public.as_compressed());
@@ -75,6 +71,7 @@ impl Keypair {
         let ephemeral_key = Keypair::generate();
 
         let mut ciphertexts = Vec::new();
+
         for i in 0..parameters.participants {
             let ciphertext = encrypt(
                 &scalar_evaluations[i as usize],
@@ -225,14 +222,21 @@ impl Keypair {
                     sum_commitments(&[&total_polynomial_commitment, point_polynomial])?;
             }
 
+            let ephemeral_key = message.content.ephemeral_key;
             let key_exchange = self.secret.key * message.content.ephemeral_key.into_point();
 
             for (i, ciphertext) in ciphertexts.iter().enumerate() {
                 let identifier = generate_identifier(recipients_hash, i as u16);
 
-                if let Ok(secret_share) =
-                    decrypt(enc.clone(), &key_exchange, ciphertext, &encryption_nonce, i)
-                {
+                if let Ok(secret_share) = decrypt(
+                    enc.clone(),
+                    &ephemeral_key,
+                    &self.public,
+                    &key_exchange,
+                    ciphertext,
+                    &encryption_nonce,
+                    i,
+                ) {
                     if secret_share * GENERATOR
                         == evaluate_polynomial_commitment(&identifier, point_polynomial)
                     {
@@ -244,11 +248,7 @@ impl Keypair {
 
             total_secret_share += secret_shares[j];
 
-            group_point += message
-                .content
-                .point_polynomial
-                .first()
-                .expect("This never fails because the minimum threshold is 2");
+            group_point += secret_commitment;
         }
 
         for i in 0..participants {

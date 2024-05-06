@@ -208,6 +208,15 @@ mod tests {
         )
         .unwrap();
 
-        decrypt(t, &key_exchange, &encrypted_share, &encryption_nonce, 0).unwrap();
+        decrypt(
+            t,
+            &ephemeral_key.public,
+            &recipient.public,
+            &key_exchange,
+            &encrypted_share,
+            &encryption_nonce,
+            0,
+        )
+        .unwrap();
     }
 }

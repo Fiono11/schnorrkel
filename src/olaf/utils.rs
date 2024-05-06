@@ -8,6 +8,7 @@ use crate::{context::SigningTranscript, PublicKey, SecretKey};
 use super::{
     data_structures::ENCRYPTION_NONCE_LENGTH,
     errors::{DKGError, DKGResult},
+    GENERATOR,
 };
 
 pub(crate) fn generate_identifier(recipients_hash: &[u8; 16], index: u16) -> Scalar {
@@ -107,12 +108,10 @@ pub(crate) fn encrypt<T: SigningTranscript>(
     i: usize,
 ) -> DKGResult<Vec<u8>> {
     transcript.commit_bytes(b"i", &i.to_le_bytes());
-    //transcript.commit_point(b"contributor", self.public.as_compressed());
-    //transcript.commit_point(b"recipient", recipient.as_compressed());
+    transcript.commit_point(b"contributor", &(ephemeral_key * GENERATOR).compress());
+    transcript.commit_point(b"recipient", recipient.as_compressed());
 
     transcript.commit_bytes(b"nonce", nonce);
-
-    //self.secret.commit_raw_key_exchange(&mut transcript, b"kex", recipient);
     transcript.commit_point(b"key exchange", &(ephemeral_key * recipient.as_point()).compress());
 
     let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
@@ -133,19 +132,17 @@ pub(crate) fn encrypt<T: SigningTranscript>(
 
 pub(crate) fn decrypt<T: SigningTranscript>(
     mut transcript: T,
+    contributor: &PublicKey,
+    recipient: &PublicKey,
     key_exchange: &RistrettoPoint,
     encrypted_scalar: &[u8],
     nonce: &[u8; ENCRYPTION_NONCE_LENGTH],
     i: usize,
 ) -> DKGResult<Scalar> {
     transcript.commit_bytes(b"i", &i.to_le_bytes());
-    //transcript.commit_point(b"contributor", sender.as_compressed());
-    //transcript.commit_point(b"recipient", self.public.as_compressed());
-
-    // Append the same nonce used during encryption
+    transcript.commit_point(b"contributor", contributor.as_compressed());
+    transcript.commit_point(b"recipient", recipient.as_compressed());
     transcript.commit_bytes(b"nonce", nonce);
-
-    //self.secret.commit_raw_key_exchange(&mut transcript, b"kex", sender);
     transcript.commit_point(b"key exchange", &key_exchange.compress());
 
     let mut key: GenericArray<u8, <chacha20poly1305::ChaCha20Poly1305 as KeySizeUser>::KeySize> =
