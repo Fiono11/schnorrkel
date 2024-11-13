@@ -167,7 +167,6 @@ impl Nonce {
         Self(transcript.challenge_scalar(b"nonce"))
     }
 
-    /* HAZMAT
     fn to_bytes(&self) -> [u8; SCALAR_LENGTH] {
         self.0.to_bytes()
     }
@@ -175,7 +174,7 @@ impl Nonce {
     fn from_bytes(bytes: [u8; SCALAR_LENGTH]) -> Self {
         Nonce(Scalar::from_bytes_mod_order(bytes))
     }
-    */
+    
 }
 
 /// A group element that is a commitment to a signing nonce share.
@@ -236,7 +235,6 @@ impl SigningNonces {
         Self::from_nonces(hiding, binding)
     }
 
-    /* HAZMAT
     /// Serializes SigningNonces into bytes.
     pub fn to_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -268,7 +266,6 @@ impl SigningNonces {
 
         Ok(Self { hiding, binding, commitments })
     }
-    */
 
     /// Generates a new [`SigningNonces`] from a pair of [`Nonce`].
     ///
